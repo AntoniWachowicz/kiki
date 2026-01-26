@@ -1,17 +1,48 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Play, Trash2 } from 'lucide-react';
+import { Upload, Play, Square, Trash2, AlertCircle, Volume2, Eye, EyeOff, Zap, Music } from 'lucide-react';
+import { analyzeImage } from './imageAnalysis';
+import { generateSound } from './soundGeneration';
+import { generateSoundLegacy } from './soundGenerationLegacy';
+import { generateSoundV2 } from './soundGenerationV2';
+import { drawSamplingPoints } from './visualizationUtils';
+import { transformImageToAngularity } from './imageTransform';
+
+// Example images available in public/examples/
+const EXAMPLE_IMAGES = [
+  { name: 'Bouba', file: 'bouba.jpg', description: 'Round, smooth shape' },
+  { name: 'Kiki', file: 'kiki.jpg', description: 'Angular, spiky shape' },
+  { name: 'Nature', file: 'nature.jpg', description: 'Organic patterns' },
+];
 
 const ImageToSoundGenerator = () => {
   const [image, setImage] = useState(null);
+  const [imageObj, setImageObj] = useState(null);  // Store image object for redrawing
+  const [originalImageObj, setOriginalImageObj] = useState(null);  // Store original for reset
   const [analysis, setAnalysis] = useState(null);
+  const [originalAnalysis, setOriginalAnalysis] = useState(null);  // Store original analysis
+  const [targetAngularity, setTargetAngularity] = useState(null);  // Slider value (0-1)
+  const [isAngularityModified, setIsAngularityModified] = useState(false);
+  const [isTransforming, setIsTransforming] = useState(false);  // Loading state during transform
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [samplingMethod, setSamplingMethod] = useState('brightness');
+  const [volume, setVolume] = useState(0.5);  // 0-1 range
+  const [showSamplingPoints, setShowSamplingPoints] = useState(true);
+  const [soundEngine, setSoundEngine] = useState('legacy');  // 'legacy' or 'v2'
+  const [error, setError] = useState(null);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const audioContextRef = useRef(null);
+  const playbackTimeoutRef = useRef(null);  // Track the playback timeout
 
   useEffect(() => {
-    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (err) {
+      setError('Your browser does not support Web Audio API. Please use a modern browser.');
+      console.error('Failed to create AudioContext:', err);
+    }
+
     return () => {
       if (audioContextRef.current) {
         audioContextRef.current.close();
@@ -19,863 +50,445 @@ const ImageToSoundGenerator = () => {
     };
   }, []);
 
-  const analyzeImage = () => {
+  // Store canvas image data to prevent unwanted redraws
+  const canvasImageDataRef = useRef(null);
+
+  // Save current canvas state
+  const saveCanvasState = () => {
+    if (!canvasRef.current) return;
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
-    
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
-    
-    let totalBrightness = 0;
-    let pixelCount = 0;
-    
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const brightness = (r + g + b) / 3;
-      totalBrightness += brightness;
-      pixelCount++;
+    canvasImageDataRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  };
+
+  // Restore canvas state (used when toggling sampling points)
+  const restoreCanvasState = () => {
+    if (!canvasRef.current || !canvasImageDataRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    ctx.putImageData(canvasImageDataRef.current, 0, 0);
+  };
+
+  // Toggle sampling points visibility
+  const handleToggleSamplingPoints = () => {
+    const newValue = !showSamplingPoints;
+    setShowSamplingPoints(newValue);
+
+    // Restore canvas from saved state (pure image without points)
+    if (!canvasRef.current || !canvasImageDataRef.current || !analysis) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+
+    // Restore the saved image (without sampling points)
+    ctx.putImageData(canvasImageDataRef.current, 0, 0);
+
+    // Draw sampling points if now enabled
+    if (newValue && analysis.samplingPoints) {
+      drawSamplingPoints(canvas, analysis.samplingPoints);
     }
-    
-    const brightness = totalBrightness / pixelCount / 255;
-    
-    // ADVANCED ANGULARITY DETECTION - Combination approach
-    // Factor 1: Edge detection and direction analysis
-    const edgeMap = [];
-    const edgeDirections = [];
-    let totalEdgeStrength = 0;
-    
-    for (let y = 1; y < canvas.height - 1; y++) {
-      edgeMap[y] = [];
-      for (let x = 1; x < canvas.width - 1; x++) {
-        const idx = (y * canvas.width + x) * 4;
-        const centerBrightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-        
-        const rightIdx = (y * canvas.width + (x + 1)) * 4;
-        const rightBrightness = (data[rightIdx] + data[rightIdx + 1] + data[rightIdx + 2]) / 3;
-        
-        const bottomIdx = ((y + 1) * canvas.width + x) * 4;
-        const bottomBrightness = (data[bottomIdx] + data[bottomIdx + 1] + data[bottomIdx + 2]) / 3;
-        
-        const gradientX = centerBrightness - rightBrightness;
-        const gradientY = centerBrightness - bottomBrightness;
-        const gradientMag = Math.sqrt(gradientX * gradientX + gradientY * gradientY);
-        
-        edgeMap[y][x] = gradientMag;
-        totalEdgeStrength += gradientMag;
-        
-        // Calculate edge direction (angle) - INCREASED threshold
-        if (gradientMag > 35) { // Was 20, now 35 - more selective
-          const angle = Math.atan2(gradientY, gradientX);
-          edgeDirections.push(angle);
-        }
-      }
-    }
-    
-    // Factor 2: Edge Direction Alignment (geometric vs organic)
-    // Quantize angles into 8 bins (0°, 45°, 90°, 135°, etc.)
-    const angleBins = new Array(8).fill(0);
-    edgeDirections.forEach(angle => {
-      // Normalize angle to 0-2π
-      const normalizedAngle = (angle + Math.PI) % (2 * Math.PI);
-      // Which bin (0-7)?
-      const bin = Math.floor((normalizedAngle / (2 * Math.PI)) * 8);
-      angleBins[bin]++;
-    });
-    
-    // Calculate variance - low variance = aligned edges (angular)
-    const avgBinCount = angleBins.reduce((a, b) => a + b, 0) / 8;
-    let angleVariance = 0;
-    angleBins.forEach(count => {
-      angleVariance += Math.pow(count - avgBinCount, 2);
-    });
-    angleVariance = Math.sqrt(angleVariance / 8);
-    
-    // Normalize: high variance = round (scattered directions), low variance = angular (aligned)
-    const directionAlignment = 1 - Math.min(angleVariance / avgBinCount, 1);
-    
-    // Factor 3: Edge Coherence (long continuous vs short broken)
-    // Trace connected edges
-    let longEdgeCount = 0;
-    let shortEdgeCount = 0;
-    const visited = new Set();
-    
-    const traceEdge = (startX, startY) => {
-      const stack = [[startX, startY]];
-      let length = 0;
-      
-      while (stack.length > 0 && length < 100) { // Cap to prevent infinite loops
-        const [x, y] = stack.pop();
-        const key = `${x},${y}`;
-        
-        if (visited.has(key)) continue;
-        if (x < 1 || x >= canvas.width - 1 || y < 1 || y >= canvas.height - 1) continue;
-        if (edgeMap[y][x] < 35) continue; // Increased from 20 to 35
-        
-        visited.add(key);
-        length++;
-        
-        // Check 8 neighbors
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            stack.push([x + dx, y + dy]);
-          }
-        }
-      }
-      
-      return length;
-    };
-    
-    // Sample edge tracing (check every 10th pixel to save computation)
-    for (let y = 1; y < canvas.height - 1; y += 10) {
-      for (let x = 1; x < canvas.width - 1; x += 10) {
-        if (edgeMap[y][x] > 35 && !visited.has(`${x},${y}`)) { // Increased from 20 to 35
-          const edgeLength = traceEdge(x, y);
-          if (edgeLength > 15) {
-            longEdgeCount++;
-          } else if (edgeLength > 3) {
-            shortEdgeCount++;
-          }
-        }
-      }
-    }
-    
-    const totalEdges = longEdgeCount + shortEdgeCount;
-    const edgeCoherence = totalEdges > 0 ? longEdgeCount / totalEdges : 0;
-    
-    // Factor 4: Corner Detection (sharp corners)
-    let sharpCornerCount = 0;
-    let totalCorners = 0;
-    
-    for (let y = 2; y < canvas.height - 2; y += 3) {
-      for (let x = 2; x < canvas.width - 2; x += 3) {
-        // Simple corner detection: check if pixel is edge and neighbors form perpendicular edges
-        if (edgeMap[y][x] > 35) { // Increased from 20 to 35
-          const hasHorizontalEdge = edgeMap[y][x-1] > 35 || edgeMap[y][x+1] > 35; // Increased threshold
-          const hasVerticalEdge = edgeMap[y-1][x] > 35 || edgeMap[y+1][x] > 35; // Increased threshold
-          
-          if (hasHorizontalEdge && hasVerticalEdge) {
-            sharpCornerCount++;
-          }
-          totalCorners++;
-        }
-      }
-    }
-    
-    const cornerSharpness = totalCorners > 0 ? sharpCornerCount / totalCorners : 0;
-    
-    // COMBINE ALL FACTORS with weights
-    // Scale down and normalize to prevent stacking
-    const rawAngularity = 
-      directionAlignment * 0.3 +      // 30% - edge alignment (geometric vs organic)
-      edgeCoherence * 0.25 +           // 25% - long continuous edges
-      cornerSharpness * 0.2;           // 20% - sharp corners
-    
-    // Apply sigmoid-like curve to spread out the middle range
-    // This prevents everything from clustering at extremes
-    let angularity;
-    if (edgeDirections.length < 50) {
-      // Very few edges detected - default to middle (ambiguous)
-      angularity = 0.5;
-    } else {
-      angularity = Math.min(Math.max(
-        (rawAngularity - 0.3) * 1.8,  // Shift center point and scale
-        0
-      ), 1);
-    }
-    
-    // COLOR EXTRACTION - for timbre
-    let totalR = 0, totalG = 0, totalB = 0;
-    let colorPixels = 0;
-    
-    for (let i = 0; i < data.length; i += 4) {
-      totalR += data[i];
-      totalG += data[i + 1];
-      totalB += data[i + 2];
-      colorPixels++;
-    }
-    
-    const avgR = totalR / colorPixels / 255;
-    const avgG = totalG / colorPixels / 255;
-    const avgB = totalB / colorPixels / 255;
-    
-    // Calculate color properties
-    const warmth = (avgR - avgB); // -1 (cool/blue) to +1 (warm/red)
-    const saturation = Math.max(avgR, avgG, avgB) - Math.min(avgR, avgG, avgB); // 0 (grayscale) to 1 (vibrant)
-    
-    // TEXTURE/GRAIN ANALYSIS - detect noise and high-frequency detail
-    let highFreqDetail = 0;
-    let detailCount = 0;
-    
-    // Look for rapid pixel-to-pixel changes (texture/grain)
-    for (let y = 2; y < canvas.height - 2; y += 2) {
-      for (let x = 2; x < canvas.width - 2; x += 2) {
-        const idx = (y * canvas.width + x) * 4;
-        const centerBright = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-        
-        // Check immediate neighbors for small-scale variation
-        let localVariation = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const nidx = ((y + dy) * canvas.width + (x + dx)) * 4;
-            const nBright = (data[nidx] + data[nidx + 1] + data[nidx + 2]) / 3;
-            localVariation += Math.abs(centerBright - nBright);
-          }
-        }
-        
-        highFreqDetail += localVariation / 8; // Average variation
-        detailCount++;
-      }
-    }
-    
-    // Normalize - high values = grainy/textured, low = smooth
-    const texture = Math.min(highFreqDetail / detailCount / 30, 1); // 0 (smooth) to 1 (grainy)
-    
-    // Sample points helper
-    const samplePoint = (x, y) => {
-      if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height) {
-        return { brightness: 0, angularity: 0 };
-      }
-      
-      const idx = (y * canvas.width + x) * 4;
-      const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3 / 255;
-      
-      let localEdge = 0;
-      let edgeCount = 0;
-      for (let dy = -2; dy <= 2; dy++) {
-        for (let dx = -2; dx <= 2; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height) {
-            const nidx = (ny * canvas.width + nx) * 4;
-            const nbrightness = (data[nidx] + data[nidx + 1] + data[nidx + 2]) / 3;
-            localEdge += Math.abs(brightness * 255 - nbrightness);
-            edgeCount++;
-          }
-        }
-      }
-      const angularity = Math.min(localEdge / edgeCount / 30, 1);
-      
-      return { brightness, angularity };
-    };
-    
-    const numSamples = 16;
-    let samples = [];
-    
-    // SAMPLING METHODS
-    if (samplingMethod === 'brightness') {
-      // Brightness pathfinding
-      const visited = new Set();
-      let maxBright = -1;
-      let startX = 0, startY = 0;
-      
-      for (let y = 0; y < canvas.height; y++) {
-        for (let x = 0; x < canvas.width; x++) {
-          const idx = (y * canvas.width + x) * 4;
-          const bright = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-          if (bright > maxBright) {
-            maxBright = bright;
-            startX = x;
-            startY = y;
-          }
-        }
-      }
-      
-      samples.push(samplePoint(startX, startY));
-      visited.add(`${startX},${startY}`);
-      
-      for (let i = 1; i < numSamples; i++) {
-        let nextBright = -1;
-        let nextX = 0, nextY = 0;
-        
-        for (let y = 0; y < canvas.height; y += 4) {
-          for (let x = 0; x < canvas.width; x += 4) {
-            const key = `${x},${y}`;
-            if (visited.has(key)) continue;
-            
-            let minDist = Infinity;
-            for (const vkey of visited) {
-              const [vx, vy] = vkey.split(',').map(Number);
-              const dist = Math.sqrt((x - vx) ** 2 + (y - vy) ** 2);
-              minDist = Math.min(minDist, dist);
-            }
-            
-            if (minDist < 20) continue;
-            
-            const idx = (y * canvas.width + x) * 4;
-            const bright = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-            if (bright > nextBright) {
-              nextBright = bright;
-              nextX = x;
-              nextY = y;
-            }
-          }
-        }
-        
-        samples.push(samplePoint(nextX, nextY));
-        visited.add(`${nextX},${nextY}`);
-      }
-    } else if (samplingMethod === 'edges') {
-      // Edge following
-      const edgePoints = [];
-      
-      for (let y = 1; y < canvas.height - 1; y += 2) {
-        for (let x = 1; x < canvas.width - 1; x += 2) {
-          const idx = (y * canvas.width + x) * 4;
-          const center = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-          
-          const rightIdx = (y * canvas.width + (x + 1)) * 4;
-          const right = (data[rightIdx] + data[rightIdx + 1] + data[rightIdx + 2]) / 3;
-          
-          const bottomIdx = ((y + 1) * canvas.width + x) * 4;
-          const bottom = (data[bottomIdx] + data[bottomIdx + 1] + data[bottomIdx + 2]) / 3;
-          
-          const gradient = Math.abs(center - right) + Math.abs(center - bottom);
-          
-          if (gradient > 30) {
-            edgePoints.push({ x, y, strength: gradient });
-          }
-        }
-      }
-      
-      edgePoints.sort((a, b) => b.strength - a.strength);
-      
-      const step = Math.max(1, Math.floor(edgePoints.length / numSamples));
-      for (let i = 0; i < numSamples && i * step < edgePoints.length; i++) {
-        const point = edgePoints[i * step];
-        samples.push(samplePoint(point.x, point.y));
-      }
-      
-      while (samples.length < numSamples) {
-        samples.push(samplePoint(
-          Math.floor(Math.random() * canvas.width),
-          Math.floor(Math.random() * canvas.height)
-        ));
-      }
-    } else if (samplingMethod === 'random') {
-      // Scattered sampling
-      const pattern = [
-        [0.1, 0.1], [0.3, 0.2], [0.6, 0.15], [0.9, 0.25],
-        [0.2, 0.4], [0.5, 0.35], [0.8, 0.45], [0.15, 0.6],
-        [0.4, 0.55], [0.7, 0.65], [0.25, 0.75], [0.55, 0.8],
-        [0.85, 0.75], [0.35, 0.9], [0.65, 0.95], [0.45, 0.5]
-      ];
-      
-      pattern.forEach(([px, py]) => {
-        const x = Math.floor(px * canvas.width);
-        const y = Math.floor(py * canvas.height);
-        samples.push(samplePoint(x, y));
-      });
-    } else {
-      // Region detection (4x4 grid)
-      const gridSize = 4;
-      const cellWidth = Math.floor(canvas.width / gridSize);
-      const cellHeight = Math.floor(canvas.height / gridSize);
-      
-      for (let gy = 0; gy < gridSize; gy++) {
-        for (let gx = 0; gx < gridSize; gx++) {
-          let sumBrightness = 0;
-          let sumEdge = 0;
-          let count = 0;
-          
-          const startX = gx * cellWidth;
-          const startY = gy * cellHeight;
-          const endX = Math.min((gx + 1) * cellWidth, canvas.width);
-          const endY = Math.min((gy + 1) * cellHeight, canvas.height);
-          
-          for (let y = startY; y < endY; y += 2) {
-            for (let x = startX; x < endX; x += 2) {
-              const sample = samplePoint(x, y);
-              sumBrightness += sample.brightness;
-              sumEdge += sample.angularity;
-              count++;
-            }
-          }
-          
-          samples.push({
-            brightness: sumBrightness / count,
-            angularity: sumEdge / count
-          });
-        }
-      }
-    }
-    
-    // Normalize brightness
-    const brightnesses = samples.map(s => s.brightness);
-    const minBright = Math.min(...brightnesses);
-    const maxBright = Math.max(...brightnesses);
-    const range = maxBright - minBright;
-    
-    let segmentData;
-    if (range > 0.01) {
-      segmentData = samples.map(s => ({
-        brightness: (s.brightness - minBright) / range,
-        angularity: s.angularity
-      }));
-    } else {
-      segmentData = samples;
-    }
-    
-    // Calculate rhythm and complexity
-    let brightnessVariation = 0;
-    for (let i = 1; i < segmentData.length; i++) {
-      brightnessVariation += Math.abs(segmentData[i].brightness - segmentData[i-1].brightness);
-    }
-    const rhythm = brightnessVariation / (segmentData.length - 1);
-    
-    let brightnessStdDev = 0;
-    let angularityStdDev = 0;
-    const avgSegBrightness = segmentData.reduce((sum, s) => sum + s.brightness, 0) / segmentData.length;
-    const avgSegAngularity = segmentData.reduce((sum, s) => sum + s.angularity, 0) / segmentData.length;
-    
-    for (let seg of segmentData) {
-      brightnessStdDev += Math.pow(seg.brightness - avgSegBrightness, 2);
-      angularityStdDev += Math.pow(seg.angularity - avgSegAngularity, 2);
-    }
-    brightnessStdDev = Math.sqrt(brightnessStdDev / segmentData.length);
-    angularityStdDev = Math.sqrt(angularityStdDev / segmentData.length);
-    
-    const complexity = Math.min((brightnessStdDev + angularityStdDev) * 3, 1);
-    
-    return {
-      brightness,
-      angularity,
-      complexity,
-      rhythm,
-      warmth,      // -1 to +1 (cool to warm)
-      saturation,  // 0 to 1 (grayscale to vibrant)
-      texture,     // 0 to 1 (smooth to grainy)
-      segmentData
-    };
   };
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const img = new Image();
-        img.onload = () => {
+    if (!file) return;
+
+    // Validate file type
+    if (!file.type.startsWith('image/')) {
+      setError('Please upload a valid image file.');
+      return;
+    }
+
+    // Validate file size (max 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      setError('Image file is too large. Please upload an image smaller than 10MB.');
+      return;
+    }
+
+    setError(null);
+    setIsAnalyzing(true);
+
+    const reader = new FileReader();
+
+    reader.onerror = () => {
+      setError('Failed to read the image file. Please try again.');
+      setIsAnalyzing(false);
+    };
+
+    reader.onload = (event) => {
+      const img = new Image();
+
+      img.onerror = () => {
+        setError('Failed to load the image. The file may be corrupted.');
+        setIsAnalyzing(false);
+      };
+
+      img.onload = () => {
+        try {
           const canvas = canvasRef.current;
           const ctx = canvas.getContext('2d');
-          
+
           // Max dimensions to keep UI reasonable
           const maxWidth = 800;
           const maxHeight = 600;
-          
+
           let width = img.width;
           let height = img.height;
-          
+
           // Scale down if too large, maintaining aspect ratio
           if (width > maxWidth || height > maxHeight) {
             const scale = Math.min(maxWidth / width, maxHeight / height);
             width = Math.floor(width * scale);
             height = Math.floor(height * scale);
           }
-          
+
           // Set canvas size to match processed dimensions
           canvas.width = width;
           canvas.height = height;
-          
+
           // Draw image at exact size
           ctx.drawImage(img, 0, 0, width, height);
-          
+
           setImage(event.target.result);
-          const analysisResult = analyzeImage();
-          setAnalysis(analysisResult);
+          setImageObj(img);  // Store image object for redrawing
+          setOriginalImageObj(img);  // Store original for reset
+
+          // Analyze the image
+          try {
+            const analysisResult = analyzeImage(canvas, samplingMethod);
+
+            // Save canvas state BEFORE drawing points (pure image)
+            saveCanvasState();
+
+            // Draw sampling points if enabled
+            if (showSamplingPoints && analysisResult.samplingPoints) {
+              drawSamplingPoints(canvas, analysisResult.samplingPoints);
+            }
+
+            setAnalysis(analysisResult);
+            setOriginalAnalysis(analysisResult);  // Store original analysis
+            setTargetAngularity(analysisResult.angularity);  // Initialize slider
+            setIsAngularityModified(false);  // Reset modification state
+            setError(null);
+          } catch (analysisError) {
+            setError(`Analysis failed: ${analysisError.message}`);
+            console.error(analysisError);
+          }
+        } catch (err) {
+          setError('Failed to process the image. Please try a different image.');
+          console.error('Image processing error:', err);
+        } finally {
+          setIsAnalyzing(false);
+        }
+      };
+
+      img.src = event.target.result;
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const loadExampleImage = async (filename) => {
+    setError(null);
+    setIsAnalyzing(true);
+
+    try {
+      const response = await fetch(`/examples/${filename}`);
+      if (!response.ok) {
+        throw new Error('Example image not found');
+      }
+
+      const blob = await response.blob();
+      const reader = new FileReader();
+
+      reader.onload = (event) => {
+        const img = new Image();
+
+        img.onerror = () => {
+          setError('Failed to load the example image.');
+          setIsAnalyzing(false);
         };
+
+        img.onload = () => {
+          try {
+            const canvas = canvasRef.current;
+            const ctx = canvas.getContext('2d');
+
+            const maxWidth = 800;
+            const maxHeight = 600;
+
+            let width = img.width;
+            let height = img.height;
+
+            if (width > maxWidth || height > maxHeight) {
+              const scale = Math.min(maxWidth / width, maxHeight / height);
+              width = Math.floor(width * scale);
+              height = Math.floor(height * scale);
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            ctx.drawImage(img, 0, 0, width, height);
+
+            setImage(event.target.result);
+            setImageObj(img);
+            setOriginalImageObj(img);
+
+            const analysisResult = analyzeImage(canvas, samplingMethod);
+
+            // Save canvas state BEFORE drawing points (pure image)
+            saveCanvasState();
+
+            // Draw sampling points if enabled
+            if (showSamplingPoints && analysisResult.samplingPoints) {
+              drawSamplingPoints(canvas, analysisResult.samplingPoints);
+            }
+
+            setAnalysis(analysisResult);
+            setOriginalAnalysis(analysisResult);
+            setTargetAngularity(analysisResult.angularity);
+            setIsAngularityModified(false);
+            setError(null);
+          } catch (err) {
+            setError('Failed to process the example image.');
+            console.error('Image processing error:', err);
+          } finally {
+            setIsAnalyzing(false);
+          }
+        };
+
         img.src = event.target.result;
       };
-      reader.readAsDataURL(file);
+
+      reader.onerror = () => {
+        setError('Failed to read the example image.');
+        setIsAnalyzing(false);
+      };
+
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      setError(`Failed to load example: ${err.message}`);
+      setIsAnalyzing(false);
+    }
+  };
+
+  const handleSamplingMethodChange = (method) => {
+    setSamplingMethod(method);
+
+    if (image && canvasRef.current && canvasImageDataRef.current) {
+      try {
+        setError(null);
+
+        // Restore clean canvas state (without sampling points) before re-analyzing
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        ctx.putImageData(canvasImageDataRef.current, 0, 0);
+
+        // Re-analyze with the clean canvas
+        const analysisResult = analyzeImage(canvas, method);
+
+        // Draw new sampling points if enabled
+        if (showSamplingPoints && analysisResult.samplingPoints) {
+          drawSamplingPoints(canvas, analysisResult.samplingPoints);
+        }
+
+        setAnalysis(analysisResult);
+      } catch (err) {
+        setError(`Failed to re-analyze with new method: ${err.message}`);
+        console.error(err);
+      }
     }
   };
 
   const clearCanvas = () => {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
-    
+
     // Reset to default size
     canvas.width = 600;
     canvas.height = 400;
-    
+
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     setImage(null);
+    setImageObj(null);
+    setOriginalImageObj(null);
     setAnalysis(null);
+    setOriginalAnalysis(null);
+    setTargetAngularity(null);
+    setIsAngularityModified(false);
+    setError(null);
   };
 
-  const generateSound = () => {
+  const PLAYBACK_DURATION = 15;  // seconds
+
+  const handleGenerateSound = async () => {
     if (!analysis || isPlaying) return;
-    
-    setIsPlaying(true);
-    const audioContext = audioContextRef.current;
-    const now = audioContext.currentTime;
-    
-    const { brightness, angularity, complexity, rhythm, warmth, saturation, texture, segmentData } = analysis;
-    
-    const masterGain = audioContext.createGain();
-    masterGain.gain.setValueAtTime(0.5, now);
-    masterGain.connect(audioContext.destination);
-    
-    const totalDuration = 5;
-    
-    const baseFreq = 220 + (brightness * 220);
-    const expandedMinorScale = [
-      0, 2, 3, 5, 7, 8, 10, 12,
-      14, 15, 17, 19, 20, 22, 24, 26
-    ];
-    
-    // DYNAMIC TEMPO based on rhythm (60 BPM to 300 BPM)
-    const bpm = 60 + (rhythm * 240);
-    const beatLength = 60 / bpm / 4; // Quarter note duration
-    
-    // COLOR-BASED TIMBRE
-    const filterCutoff = 500 + (warmth + 1) * 2000; // 500Hz (cool) to 4500Hz (warm)
-    const harmonicRichness = saturation; // 0 (pure) to 1 (rich)
-    
-    // TEXTURE-BASED GRIT
-    const noiseAmount = texture; // 0 (clean) to 1 (gritty)
-    const distortionAmount = texture * 0.3; // Subtle distortion for grainy images
-    
-    // Helper: Add noise/grit to a gain node
-    const addNoise = (gainNode, time, duration) => {
-      if (noiseAmount < 0.05) return; // Lowered threshold - was 0.1, now 0.05
-      
-      const noiseBufferSize = audioContext.sampleRate * duration;
-      const noiseBuffer = audioContext.createBuffer(1, noiseBufferSize, audioContext.sampleRate);
-      const noiseData = noiseBuffer.getChannelData(0);
-      
-      for (let i = 0; i < noiseBufferSize; i++) {
-        // Pink noise for analog warmth - INCREASED
-        noiseData[i] = (Math.random() * 2 - 1) * noiseAmount * 0.5; // Was 0.15, now 0.5
-      }
-      
-      const noise = audioContext.createBufferSource();
-      noise.buffer = noiseBuffer;
-      
-      const noiseGain = audioContext.createGain();
-      noiseGain.gain.setValueAtTime(noiseAmount * 0.6, time); // Was 0.2, now 0.6
-      
-      noise.connect(noiseGain);
-      noiseGain.connect(gainNode);
-      noise.start(time);
-    };
-    
-    // Helper: Create FM synthesis oscillator (for complex images)
-    const createFMOsc = (carrierFreq, time, duration) => {
-      // Modulator frequency ratio based on complexity
-      const modRatio = 1 + complexity * 3; // 1:1 to 4:1 ratio
-      const modFreq = carrierFreq * modRatio;
-      
-      // Modulation index based on saturation
-      const modIndex = saturation * 5; // 0 to 5
-      
-      const carrier = audioContext.createOscillator();
-      carrier.frequency.setValueAtTime(carrierFreq, time);
-      
-      const modulator = audioContext.createOscillator();
-      modulator.frequency.setValueAtTime(modFreq, time);
-      
-      const modGain = audioContext.createGain();
-      modGain.gain.setValueAtTime(carrierFreq * modIndex, time);
-      
-      modulator.connect(modGain);
-      modGain.connect(carrier.frequency);
-      
-      modulator.start(time);
-      modulator.stop(time + duration);
-      carrier.start(time);
-      carrier.stop(time + duration);
-      
-      return { carrier, modulator };
-    };
-    
-    if (angularity > 0.5) {
-      // KIKI MODE - with FM synthesis for complex images
-      const bassNotes = [0, 0, 5, 0, 3, 0, 5, 3];
-      
-      for (let i = 0; i < Math.floor(totalDuration / beatLength); i++) {
-        const time = now + (i * beatLength);
-        const noteIndex = bassNotes[i % bassNotes.length];
-        const freq = (baseFreq * 0.5) * Math.pow(2, expandedMinorScale[noteIndex] / 12);
-        
-        const osc = audioContext.createOscillator();
-        osc.type = warmth > 0 ? 'square' : 'sawtooth';
-        osc.frequency.setValueAtTime(freq, time);
-        
-        const filter = audioContext.createBiquadFilter();
-        filter.type = 'lowpass';
-        filter.frequency.setValueAtTime(filterCutoff, time);
-        filter.Q.setValueAtTime(1 + harmonicRichness * 10, time);
-        
-        const gain = audioContext.createGain();
-        const noteDuration = beatLength * (0.3 + complexity * 0.4);
-        gain.gain.setValueAtTime(0.25, time);
-        gain.gain.exponentialRampToValueAtTime(0.01, time + noteDuration);
-        
-        osc.connect(filter);
-        filter.connect(gain);
-        gain.connect(masterGain);
-        
-        // Add grit/noise for textured images
-        addNoise(gain, time, noteDuration);
-        
-        osc.start(time);
-        osc.stop(time + noteDuration);
-      }
-      
-      // MELODY - Use FM synthesis for complex images
-      segmentData.forEach((segment, index) => {
-        const time = now + (index * (totalDuration / segmentData.length));
-        const noteIndex = Math.floor(segment.brightness * 15);
-        const freq = baseFreq * 2 * Math.pow(2, expandedMinorScale[noteIndex] / 12);
-        
-        const noteDuration = 0.05 + (1 - segment.angularity) * 0.15;
-        
-        // Use FM synthesis if complexity is high
-        if (complexity > 0.6) {
-          const fm = createFMOsc(freq, time, noteDuration);
-          
-          const filter = audioContext.createBiquadFilter();
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(filterCutoff * 1.5, time);
-          
-          const gain = audioContext.createGain();
-          gain.gain.setValueAtTime(0.15, time);
-          gain.gain.exponentialRampToValueAtTime(0.01, time + noteDuration);
-          
-          fm.carrier.connect(filter);
-          filter.connect(gain);
-          gain.connect(masterGain);
-          
-          addNoise(gain, time, noteDuration);
-        } else {
-          // Standard oscillator for simpler images
-          const osc = audioContext.createOscillator();
-          osc.type = saturation > 0.5 ? 'sawtooth' : 'triangle';
-          osc.frequency.setValueAtTime(freq, time);
-          
-          const filter = audioContext.createBiquadFilter();
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(filterCutoff * 1.5, time);
-          
-          const gain = audioContext.createGain();
-          gain.gain.setValueAtTime(0.18, time);
-          gain.gain.exponentialRampToValueAtTime(0.01, time + noteDuration);
-          
-          osc.connect(filter);
-          filter.connect(gain);
-          gain.connect(masterGain);
-          
-          addNoise(gain, time, noteDuration);
-          
-          osc.start(time);
-          osc.stop(time + noteDuration);
-        }
-      });
-      
-      // Drums with texture-based grit
-      for (let i = 0; i < totalDuration / beatLength; i++) {
-        const time = now + (i * beatLength);
-        
-        const kick = audioContext.createOscillator();
-        kick.frequency.setValueAtTime(150, time);
-        kick.frequency.exponentialRampToValueAtTime(40, time + 0.05);
-        
-        const gain = audioContext.createGain();
-        gain.gain.setValueAtTime(0.35, time);
-        gain.gain.exponentialRampToValueAtTime(0.01, time + 0.15);
-        
-        kick.connect(gain);
-        gain.connect(masterGain);
-        
-        // Add vinyl crackle to textured images - LOWERED threshold
-        if (texture > 0.3) { // Was 0.5, now 0.3
-          addNoise(gain, time, 0.15);
-        }
-        
-        kick.start(time);
-        kick.stop(time + 0.15);
-      }
-      
-      for (let i = 0; i < totalDuration / (beatLength / 2); i++) {
-        const time = now + (i * beatLength / 2);
-        
-        const bufferSize = audioContext.sampleRate * 0.03;
-        const buffer = audioContext.createBuffer(1, bufferSize, audioContext.sampleRate);
-        const data = buffer.getChannelData(0);
-        
-        for (let j = 0; j < bufferSize; j++) {
-          data[j] = (Math.random() * 2 - 1) * Math.exp(-j / (bufferSize * 0.05));
-        }
-        
-        const noise = audioContext.createBufferSource();
-        noise.buffer = buffer;
-        
-        const filter = audioContext.createBiquadFilter();
-        filter.type = 'highpass';
-        filter.frequency.setValueAtTime(8000, time);
-        
-        const gain = audioContext.createGain();
-        gain.gain.setValueAtTime(0.08, time);
-        gain.gain.exponentialRampToValueAtTime(0.001, time + 0.03);
-        
-        noise.connect(filter);
-        filter.connect(gain);
-        gain.connect(masterGain);
-        noise.start(time);
-      }
-      
-    } else {
-      // BOUBA MODE - with FM synthesis for complex images
-      const bassDrone = audioContext.createOscillator();
-      bassDrone.type = 'sine';
-      bassDrone.frequency.setValueAtTime(baseFreq * 0.5, now);
-      
-      const bassFilter = audioContext.createBiquadFilter();
-      bassFilter.type = 'lowpass';
-      bassFilter.frequency.setValueAtTime(filterCutoff * 0.8, now);
-      bassFilter.Q.setValueAtTime(1 + harmonicRichness * 5, now);
-      
-      const bassGain = audioContext.createGain();
-      bassGain.gain.setValueAtTime(0, now);
-      bassGain.gain.linearRampToValueAtTime(0.2, now + 1);
-      bassGain.gain.linearRampToValueAtTime(0.2, now + totalDuration - 1);
-      bassGain.gain.linearRampToValueAtTime(0, now + totalDuration);
-      
-      bassDrone.connect(bassFilter);
-      bassFilter.connect(bassGain);
-      bassGain.connect(masterGain);
-      
-      // Add subtle analog warmth to bass
-      addNoise(bassGain, now, totalDuration);
-      
-      bassDrone.start(now);
-      bassDrone.stop(now + totalDuration);
-      
-      const noteDuration = totalDuration / segmentData.length;
-      
-      // MELODY - Use FM for complex, standard for simple
-      segmentData.forEach((segment, index) => {
-        const time = now + (index * noteDuration);
-        const noteIndex = Math.floor(segment.brightness * 15);
-        const freq = baseFreq * Math.pow(2, expandedMinorScale[noteIndex] / 12);
-        
-        const attackTime = 0.2 + (1 - complexity) * 0.3;
-        const decayTime = 0.2 + (1 - complexity) * 0.3;
-        
-        // Use FM synthesis for complex images
-        if (complexity > 0.6) {
-          const fm = createFMOsc(freq, time, noteDuration);
-          
-          if (index < segmentData.length - 1) {
-            const nextNoteIndex = Math.floor(segmentData[index + 1].brightness * 15);
-            const nextFreq = baseFreq * Math.pow(2, expandedMinorScale[nextNoteIndex] / 12);
-            const glideTime = noteDuration * (0.5 + (1 - complexity) * 0.3);
-            fm.carrier.frequency.exponentialRampToValueAtTime(nextFreq, time + glideTime);
-          }
-          
-          const filter = audioContext.createBiquadFilter();
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(filterCutoff * 0.9, time);
-          
-          const gain = audioContext.createGain();
-          gain.gain.setValueAtTime(0, time);
-          gain.gain.linearRampToValueAtTime(0.12, time + attackTime);
-          gain.gain.linearRampToValueAtTime(0.1, time + noteDuration - decayTime);
-          gain.gain.linearRampToValueAtTime(0, time + noteDuration);
-          
-          fm.carrier.connect(filter);
-          filter.connect(gain);
-          gain.connect(masterGain);
-          
-          addNoise(gain, time, noteDuration);
-        } else {
-          // Standard oscillator
-          const osc = audioContext.createOscillator();
-          osc.type = warmth > 0 ? 'triangle' : 'sine';
-          osc.frequency.setValueAtTime(freq, time);
-          
-          if (index < segmentData.length - 1) {
-            const nextNoteIndex = Math.floor(segmentData[index + 1].brightness * 15);
-            const nextFreq = baseFreq * Math.pow(2, expandedMinorScale[nextNoteIndex] / 12);
-            const glideTime = noteDuration * (0.5 + (1 - complexity) * 0.3);
-            osc.frequency.exponentialRampToValueAtTime(nextFreq, time + glideTime);
-          }
-          
-          const filter = audioContext.createBiquadFilter();
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(filterCutoff, time);
-          
-          const gain = audioContext.createGain();
-          gain.gain.setValueAtTime(0, time);
-          gain.gain.linearRampToValueAtTime(0.15, time + attackTime);
-          gain.gain.linearRampToValueAtTime(0.12, time + noteDuration - decayTime);
-          gain.gain.linearRampToValueAtTime(0, time + noteDuration);
-          
-          osc.connect(filter);
-          filter.connect(gain);
-          gain.connect(masterGain);
-          
-          addNoise(gain, time, noteDuration);
-          
-          osc.start(time);
-          osc.stop(time + noteDuration);
-        }
-      });
-      
-      const chordNotes = [0, 3, 5, 7];
-      
-      chordNotes.forEach((noteOffset) => {
-        const freq = baseFreq * Math.pow(2, expandedMinorScale[noteOffset] / 12);
-        
-        const osc = audioContext.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, now);
-        
-        const vibrato = audioContext.createOscillator();
-        vibrato.frequency.setValueAtTime(5, now);
-        const vibratoGain = audioContext.createGain();
-        vibratoGain.gain.setValueAtTime(3 + saturation * 5, now);
-        vibrato.connect(vibratoGain);
-        vibratoGain.connect(osc.frequency);
-        
-        const filter = audioContext.createBiquadFilter();
-        filter.type = 'lowpass';
-        filter.frequency.setValueAtTime(filterCutoff * 1.2, now);
-        
-        const gain = audioContext.createGain();
-        gain.gain.setValueAtTime(0, now);
-        gain.gain.linearRampToValueAtTime(0.04, now + 1.5);
-        gain.gain.linearRampToValueAtTime(0.04, now + totalDuration - 1.5);
-        gain.gain.linearRampToValueAtTime(0, now + totalDuration);
-        
-        osc.connect(filter);
-        filter.connect(gain);
-        gain.connect(masterGain);
-        
-        // Subtle texture on pads - LOWERED threshold
-        if (texture > 0.2) { // Was 0.3, now 0.2
-          addNoise(gain, now, totalDuration);
-        }
-        
-        osc.start(now);
-        osc.stop(now + totalDuration);
-        vibrato.start(now);
-        vibrato.stop(now + totalDuration);
-      });
+
+    if (!audioContextRef.current) {
+      setError('Audio context is not available. Please refresh the page.');
+      return;
     }
-    
-    setTimeout(() => setIsPlaying(false), totalDuration * 1000);
+
+    // Clear any existing timeout
+    if (playbackTimeoutRef.current) {
+      clearTimeout(playbackTimeoutRef.current);
+    }
+
+    try {
+      setError(null);
+      setIsPlaying(true);
+
+      // Select sound generation function based on engine choice
+      const generateFn = soundEngine === 'v2' ? generateSoundV2 : generateSoundLegacy;
+
+      // Don't await - let it run, we'll manage timing ourselves
+      generateFn(audioContextRef.current, analysis, PLAYBACK_DURATION, volume);
+
+      // Set our own timeout to track when playback ends
+      playbackTimeoutRef.current = setTimeout(() => {
+        setIsPlaying(false);
+        playbackTimeoutRef.current = null;
+      }, PLAYBACK_DURATION * 1000);
+
+    } catch (err) {
+      setError(`Sound generation failed: ${err.message}`);
+      console.error(err);
+      setIsPlaying(false);
+    }
+  };
+
+  const handleStopSound = async () => {
+    if (!isPlaying) return;
+
+    // Clear the playback timeout
+    if (playbackTimeoutRef.current) {
+      clearTimeout(playbackTimeoutRef.current);
+      playbackTimeoutRef.current = null;
+    }
+
+    try {
+      // Close current audio context to stop all scheduled sounds
+      if (audioContextRef.current) {
+        await audioContextRef.current.close();
+      }
+
+      // Create a new audio context for future use
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      setIsPlaying(false);
+    } catch (err) {
+      console.error('Failed to stop audio:', err);
+      setIsPlaying(false);
+    }
+  };
+
+  // Called during slider drag - just update the display value
+  const handleAngularityDrag = (newAngularity) => {
+    const newValue = parseFloat(newAngularity);
+    setTargetAngularity(newValue);
+
+    // Show as modified if different from original
+    if (originalAnalysis) {
+      setIsAngularityModified(Math.abs(newValue - originalAnalysis.angularity) >= 0.01);
+    }
+  };
+
+  // Called when slider is released - do the actual transformation
+  const handleAngularityCommit = async () => {
+    if (!originalAnalysis || !originalImageObj || targetAngularity === null) return;
+
+    const newValue = targetAngularity;
+
+    // Check if we're back to original (within small threshold)
+    if (Math.abs(newValue - originalAnalysis.angularity) < 0.01) {
+      // Reset to original
+      setIsAngularityModified(false);
+      setAnalysis(originalAnalysis);
+
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(originalImageObj, 0, 0, canvas.width, canvas.height);
+
+      saveCanvasState();
+
+      if (showSamplingPoints && originalAnalysis.samplingPoints) {
+        drawSamplingPoints(canvas, originalAnalysis.samplingPoints);
+      }
+      return;
+    }
+
+    // Do the transformation
+    setIsTransforming(true);
+
+    try {
+      console.log(`Transforming to ${(newValue * 100).toFixed(1)}%...`);
+
+      const currentCanvas = canvasRef.current;
+      const transformedCanvas = await transformImageToAngularity(
+        originalImageObj,
+        originalAnalysis.angularity,
+        newValue,
+        currentCanvas.width,
+        currentCanvas.height
+      );
+
+      // Draw transformed canvas to main canvas
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(transformedCanvas, 0, 0);
+
+      // Re-analyze the transformed image
+      const newAnalysis = analyzeImage(canvas, samplingMethod);
+
+      console.log(`Target: ${(newValue * 100).toFixed(1)}%, Actual: ${(newAnalysis.angularity * 100).toFixed(1)}%`);
+
+      // Save state and draw points
+      saveCanvasState();
+
+      if (showSamplingPoints && newAnalysis.samplingPoints) {
+        drawSamplingPoints(canvas, newAnalysis.samplingPoints);
+      }
+
+      setAnalysis(newAnalysis);
+      console.log(`Transformation complete.`);
+
+    } catch (err) {
+      setError(`Transformation failed: ${err.message}`);
+      console.error('Transformation error:', err);
+    } finally {
+      setIsTransforming(false);
+    }
+  };
+
+  const handleAngularityReset = () => {
+    if (!originalAnalysis || !originalImageObj) return;
+
+    setTargetAngularity(originalAnalysis.angularity);
+    setIsAngularityModified(false);
+    setAnalysis(originalAnalysis);
+    setImageObj(originalImageObj);
+
+    // Redraw original image
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(originalImageObj, 0, 0, canvas.width, canvas.height);
+
+    // Save state BEFORE drawing points
+    saveCanvasState();
+
+    // Redraw sampling points if enabled
+    if (showSamplingPoints && originalAnalysis.samplingPoints) {
+      drawSamplingPoints(canvas, originalAnalysis.samplingPoints);
+    }
   };
 
   return (
     <div className="min-h-screen bg-neutral-900 flex items-center justify-center p-8">
       <div className="w-full max-w-7xl h-[90vh] bg-neutral-800 rounded-2xl border-2 border-neutral-700 overflow-hidden flex">
-        
+
         {/* LEFT SIDE */}
         <div className="flex-1 p-8 flex flex-col border-r border-neutral-700">
           <div className="mb-6">
@@ -883,17 +496,33 @@ const ImageToSoundGenerator = () => {
             <p className="text-neutral-400">Visual to Sound Translation</p>
           </div>
 
+          {/* Error Display */}
+          {error && (
+            <div className="mb-4 p-4 bg-red-900/30 border border-red-500 rounded-lg flex items-start gap-3">
+              <AlertCircle size={20} className="text-red-400 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="text-sm text-red-200">{error}</p>
+              </div>
+            </div>
+          )}
+
           <div className="flex gap-3 mb-6">
             <button
               onClick={() => fileInputRef.current.click()}
-              className="px-5 py-2.5 bg-white text-neutral-900 rounded-lg hover:bg-neutral-200 transition-colors font-bold flex items-center gap-2"
+              disabled={isAnalyzing}
+              className={`px-5 py-2.5 rounded-lg transition-colors font-bold flex items-center gap-2 ${
+                isAnalyzing
+                  ? 'bg-neutral-600 text-neutral-400 cursor-not-allowed'
+                  : 'bg-white text-neutral-900 hover:bg-neutral-200'
+              }`}
             >
               <Upload size={18} />
-              Upload Image
+              {isAnalyzing ? 'Processing...' : 'Upload Image'}
             </button>
             <button
               onClick={clearCanvas}
-              className="px-5 py-2.5 bg-neutral-700 text-white rounded-lg hover:bg-neutral-600 transition-colors font-semibold flex items-center gap-2 border border-neutral-600"
+              disabled={isAnalyzing}
+              className="px-5 py-2.5 bg-neutral-700 text-white rounded-lg hover:bg-neutral-600 transition-colors font-semibold flex items-center gap-2 border border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Trash2 size={18} />
               Clear
@@ -908,6 +537,37 @@ const ImageToSoundGenerator = () => {
             className="hidden"
           />
 
+          {/* Example Images Row */}
+          <div className="mb-6">
+            <p className="text-xs text-neutral-500 mb-2 uppercase tracking-wider font-semibold">Try an example:</p>
+            <div className="flex gap-3">
+              {EXAMPLE_IMAGES.map((example) => (
+                <button
+                  key={example.file}
+                  onClick={() => loadExampleImage(example.file)}
+                  disabled={isAnalyzing}
+                  className="group relative flex-1 aspect-square max-w-[100px] rounded-lg overflow-hidden border-2 border-neutral-700 hover:border-neutral-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-neutral-800"
+                >
+                  <img
+                    src={`/examples/${example.file}`}
+                    alt={example.name}
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      e.target.style.display = 'none';
+                      e.target.nextSibling.style.display = 'flex';
+                    }}
+                  />
+                  <div className="hidden w-full h-full items-center justify-center text-neutral-600">
+                    <span className="text-xs">{example.name}</span>
+                  </div>
+                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                    <span className="text-xs text-white font-semibold">{example.name}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="flex-1 border-2 border-neutral-700 rounded-xl overflow-hidden bg-black flex items-center justify-center">
             <canvas
               ref={canvasRef}
@@ -920,8 +580,8 @@ const ImageToSoundGenerator = () => {
           {analysis && (
             <div className="mt-6 grid grid-cols-2 gap-4">
               <div className={`p-4 rounded-xl border-2 transition-all ${
-                analysis.angularity <= 0.5 
-                  ? 'bg-blue-950/50 border-blue-500' 
+                analysis.angularity <= 0.5
+                  ? 'bg-blue-950/50 border-blue-500'
                   : 'bg-neutral-900/30 border-neutral-700/30'
               }`}>
                 <div className="flex items-center gap-2 mb-2">
@@ -932,8 +592,8 @@ const ImageToSoundGenerator = () => {
               </div>
 
               <div className={`p-4 rounded-xl border-2 transition-all ${
-                analysis.angularity > 0.5 
-                  ? 'bg-red-950/50 border-red-500' 
+                analysis.angularity > 0.5
+                  ? 'bg-red-950/50 border-red-500'
                   : 'bg-neutral-900/30 border-neutral-700/30'
               }`}>
                 <div className="flex items-center gap-2 mb-2">
@@ -955,85 +615,106 @@ const ImageToSoundGenerator = () => {
                 <p className="text-sm text-neutral-400">Visual properties mapped to sound</p>
               </div>
 
-              {/* Sampling Method Selector */}
-              <div className="mb-6 bg-neutral-900/50 p-4 rounded-xl border border-neutral-700">
-                <h3 className="text-sm font-bold text-white mb-3 uppercase tracking-wider">Melody Sampling Method</h3>
-                <div className="space-y-2">
-                  <label className="flex items-center gap-3 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="sampling"
-                      value="brightness"
-                      checked={samplingMethod === 'brightness'}
-                      onChange={(e) => {
-                        setSamplingMethod(e.target.value);
-                        const result = analyzeImage();
-                        setAnalysis(result);
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <div>
-                      <span className="text-sm text-white">Brightness Pathfinding</span>
-                      <p className="text-xs text-neutral-500">Follow the light</p>
-                    </div>
-                  </label>
-                  
-                  <label className="flex items-center gap-3 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="sampling"
-                      value="edges"
-                      checked={samplingMethod === 'edges'}
-                      onChange={(e) => {
-                        setSamplingMethod(e.target.value);
-                        const result = analyzeImage();
-                        setAnalysis(result);
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <div>
-                      <span className="text-sm text-white">Edge Following</span>
-                      <p className="text-xs text-neutral-500">Trace edges</p>
-                    </div>
-                  </label>
-                  
-                  <label className="flex items-center gap-3 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="sampling"
-                      value="random"
-                      checked={samplingMethod === 'random'}
-                      onChange={(e) => {
-                        setSamplingMethod(e.target.value);
-                        const result = analyzeImage();
-                        setAnalysis(result);
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <div>
-                      <span className="text-sm text-white">Scattered</span>
-                      <p className="text-xs text-neutral-500">Fixed pattern</p>
-                    </div>
-                  </label>
-                  
-                  <label className="flex items-center gap-3 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="sampling"
-                      value="regions"
-                      checked={samplingMethod === 'regions'}
-                      onChange={(e) => {
-                        setSamplingMethod(e.target.value);
-                        const result = analyzeImage();
-                        setAnalysis(result);
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <div>
-                      <span className="text-sm text-white">Regions</span>
-                      <p className="text-xs text-neutral-500">4×4 grid</p>
-                    </div>
-                  </label>
+              {/* Sampling Method Selector - Compact */}
+              <div className="mb-4 flex items-center gap-3">
+                <span className="text-xs text-neutral-400 font-semibold uppercase whitespace-nowrap">Sampling:</span>
+                <div className="flex flex-1 rounded-lg overflow-hidden border border-neutral-600">
+                  {[
+                    { value: 'brightness', label: 'Bright' },
+                    { value: 'edges', label: 'Edges' },
+                    { value: 'random', label: 'Scatter' },
+                    { value: 'regions', label: 'Grid' },
+                  ].map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => handleSamplingMethodChange(option.value)}
+                      className={`flex-1 px-2 py-1.5 text-xs font-semibold transition-colors ${
+                        samplingMethod === option.value
+                          ? 'bg-yellow-500 text-black'
+                          : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Volume Control */}
+              <div className="mb-4 bg-neutral-900/50 p-4 rounded-xl border border-neutral-700">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <Volume2 size={16} className="text-blue-400" />
+                    <h3 className="text-sm font-bold text-white uppercase tracking-wider">Volume</h3>
+                  </div>
+                  <span className="text-sm text-white font-bold">{Math.round(volume * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={volume * 100}
+                  onChange={(e) => setVolume(e.target.value / 100)}
+                  className="w-full h-2 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                />
+              </div>
+
+              {/* Sound Engine Selector */}
+              <div className="mb-4 flex items-center gap-3">
+                <span className="text-xs text-neutral-400 font-semibold uppercase whitespace-nowrap">Engine:</span>
+                <div className="flex flex-1 rounded-lg overflow-hidden border border-neutral-600">
+                  <button
+                    onClick={() => setSoundEngine('legacy')}
+                    className={`flex-1 px-3 py-1.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 ${
+                      soundEngine === 'legacy'
+                        ? 'bg-blue-500 text-white'
+                        : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white'
+                    }`}
+                  >
+                    <Music size={12} />
+                    Legacy
+                  </button>
+                  <button
+                    onClick={() => setSoundEngine('v2')}
+                    className={`flex-1 px-3 py-1.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 ${
+                      soundEngine === 'v2'
+                        ? 'bg-purple-500 text-white'
+                        : 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700 hover:text-white'
+                    }`}
+                  >
+                    <Zap size={12} />
+                    V2 (Experimental)
+                  </button>
+                </div>
+              </div>
+
+              {/* Sampling Points Toggle & Histogram */}
+              <div className="mb-4 flex gap-3">
+                {/* Sampling Points Toggle */}
+                <button
+                  onClick={handleToggleSamplingPoints}
+                  className={`flex-1 px-4 py-2.5 rounded-lg border-2 transition-all font-semibold text-sm flex items-center justify-center gap-2 ${
+                    showSamplingPoints
+                      ? 'bg-yellow-500/20 border-yellow-500 text-yellow-400'
+                      : 'bg-neutral-800 border-neutral-600 text-neutral-400 hover:border-neutral-500'
+                  }`}
+                >
+                  {showSamplingPoints ? <Eye size={16} /> : <EyeOff size={16} />}
+                  {showSamplingPoints ? 'Hide Points' : 'Show Points'}
+                </button>
+
+                {/* Histogram Display - Inline miniature */}
+                <div className="flex-1 px-4 py-2.5 rounded-lg border-2 border-neutral-600 bg-neutral-800 flex items-center gap-3">
+                  <span className="text-xs text-neutral-400 font-semibold whitespace-nowrap">Histogram:</span>
+                  <div className="flex-1 flex items-end gap-0.5 h-8">
+                    {analysis.histogram && analysis.histogram.map((value, i) => (
+                      <div
+                        key={i}
+                        className="flex-1 bg-gradient-to-t from-yellow-600 to-yellow-400 rounded-t-sm"
+                        style={{ height: `${value * 100}%`, minHeight: '2px' }}
+                      />
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -1058,7 +739,7 @@ const ImageToSoundGenerator = () => {
                   </div>
                 </div>
 
-                {/* Color Warmth (NEW) */}
+                {/* Color Warmth */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
                     <div>
@@ -1079,7 +760,7 @@ const ImageToSoundGenerator = () => {
                   <p className="text-xs text-neutral-500 mt-2">→ Affects timbre & tone color</p>
                 </div>
 
-                {/* Saturation (NEW) */}
+                {/* Saturation */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
                     <div>
@@ -1100,11 +781,15 @@ const ImageToSoundGenerator = () => {
                   <p className="text-xs text-neutral-500 mt-2">→ Harmonic richness</p>
                 </div>
 
+                {/* Shape/Angularity */}
                 <div className="bg-neutral-900/50 p-5 rounded-xl border-2 border-neutral-700">
                   <div className="flex justify-between items-center mb-3">
                     <div>
                       <span className="text-sm font-bold text-white uppercase tracking-wider">
                         {analysis.angularity <= 0.5 ? '◯' : '◆'} Shape
+                        {isAngularityModified && (
+                          <span className="ml-2 text-xs text-yellow-400 font-normal">(Modified)</span>
+                        )}
                       </span>
                       <p className="text-xs text-neutral-500 mt-1">Round ←→ Angular</p>
                     </div>
@@ -1113,12 +798,76 @@ const ImageToSoundGenerator = () => {
                       <span className="text-sm text-neutral-500">%</span>
                     </div>
                   </div>
-                  <div className="w-full bg-neutral-900 rounded-full h-3 overflow-hidden">
+
+                  {/* Current angularity bar */}
+                  <div className="w-full bg-neutral-900 rounded-full h-3 overflow-hidden mb-4">
                     <div
                       className="bg-gradient-to-r from-blue-600 via-purple-500 to-red-600 h-3 transition-all duration-500"
                       style={{ width: `${analysis.angularity * 100}%` }}
                     />
                   </div>
+
+                  {/* Angularity manipulation slider */}
+                  <div className="mt-4 pt-4 border-t border-neutral-700">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-xs text-neutral-400 font-semibold uppercase">
+                        Adjust Angularity
+                      </span>
+                      {isAngularityModified && (
+                        <button
+                          onClick={handleAngularityReset}
+                          disabled={isTransforming}
+                          className="text-xs text-yellow-400 hover:text-yellow-300 font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          Reset to Original
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Slider with original marker */}
+                    <div className="relative mb-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={targetAngularity ? targetAngularity * 100 : 0}
+                        onChange={(e) => handleAngularityDrag(e.target.value / 100)}
+                        onMouseUp={handleAngularityCommit}
+                        onTouchEnd={handleAngularityCommit}
+                        disabled={isTransforming || !originalAnalysis}
+                        className="w-full h-2 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                      />
+
+                      {/* Original value marker */}
+                      {originalAnalysis && (
+                        <div
+                          className="absolute top-0 w-1 h-6 bg-yellow-400 rounded pointer-events-none shadow-lg"
+                          style={{
+                            left: `calc(${originalAnalysis.angularity * 100}% - 2px)`,
+                            transform: 'translateY(-50%)'
+                          }}
+                          title={`Original: ${(originalAnalysis.angularity * 100).toFixed(0)}%`}
+                        />
+                      )}
+                    </div>
+
+                    {/* Value display */}
+                    <div className="flex justify-between text-xs">
+                      <span className="text-neutral-500">
+                        Original: {originalAnalysis ? (originalAnalysis.angularity * 100).toFixed(0) : '-'}%
+                      </span>
+                      <span className="text-white font-semibold">
+                        Target: {targetAngularity ? (targetAngularity * 100).toFixed(0) : '-'}%
+                      </span>
+                    </div>
+
+                    {isTransforming && (
+                      <p className="text-xs text-yellow-400 mt-2 text-center animate-pulse">
+                        Transforming and re-analyzing...
+                      </p>
+                    )}
+                  </div>
+
                   <div className="flex justify-between text-xs mt-3">
                     <span className={`${analysis.angularity <= 0.5 ? 'text-blue-400 font-bold' : 'text-neutral-600'}`}>
                       ← Bouba
@@ -1129,6 +878,7 @@ const ImageToSoundGenerator = () => {
                   </div>
                 </div>
 
+                {/* Complexity */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
                     <div>
@@ -1149,7 +899,7 @@ const ImageToSoundGenerator = () => {
                   <p className="text-xs text-neutral-500 mt-2">→ FM synthesis threshold</p>
                 </div>
 
-                {/* Texture (NEW) */}
+                {/* Texture */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
                     <div>
@@ -1170,6 +920,7 @@ const ImageToSoundGenerator = () => {
                   <p className="text-xs text-neutral-500 mt-2">→ Analog noise & grit</p>
                 </div>
 
+                {/* Rhythm */}
                 <div>
                   <div className="flex justify-between items-center mb-3">
                     <div>
@@ -1191,18 +942,23 @@ const ImageToSoundGenerator = () => {
                 </div>
               </div>
 
-              <button
-                onClick={generateSound}
-                disabled={isPlaying}
-                className={`w-full mt-6 flex items-center justify-center gap-3 px-8 py-5 rounded-xl font-bold text-xl transition-all ${
-                  isPlaying
-                    ? 'bg-neutral-700 text-neutral-500 cursor-not-allowed'
-                    : 'bg-gradient-to-r from-blue-600 to-red-600 text-white hover:from-blue-500 hover:to-red-500'
-                }`}
-              >
-                <Play size={24} fill="currentColor" />
-                {isPlaying ? 'Generating...' : 'Generate Sound'}
-              </button>
+              {isPlaying ? (
+                <button
+                  onClick={handleStopSound}
+                  className="w-full mt-6 flex items-center justify-center gap-3 px-8 py-5 rounded-xl font-bold text-xl transition-all bg-red-600 text-white hover:bg-red-500"
+                >
+                  <Square size={24} fill="currentColor" />
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={handleGenerateSound}
+                  className="w-full mt-6 flex items-center justify-center gap-3 px-8 py-5 rounded-xl font-bold text-xl transition-all bg-gradient-to-r from-blue-600 to-red-600 text-white hover:from-blue-500 hover:to-red-500"
+                >
+                  <Play size={24} fill="currentColor" />
+                  Generate Sound (15s)
+                </button>
+              )}
             </>
           ) : (
             <div className="flex-1 flex items-center justify-center">
