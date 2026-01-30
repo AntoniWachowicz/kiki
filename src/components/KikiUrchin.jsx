@@ -6,13 +6,28 @@ const KikiUrchin = () => {
 
   useEffect(() => {
     const container = containerRef.current;
-    const width = container.offsetWidth;
-    const height = container.offsetHeight;
+    let width = container.offsetWidth;
+    let height = container.offsetHeight;
+
+    // Create reveal image behind the canvas
+    const revealImg = document.createElement('img');
+    revealImg.src = '/examples/kiki.jpg';
+    revealImg.style.position = 'absolute';
+    revealImg.style.top = '0';
+    revealImg.style.left = '0';
+    revealImg.style.width = '100%';
+    revealImg.style.height = '100%';
+    revealImg.style.objectFit = 'cover';
+    container.style.position = 'relative';
+    container.appendChild(revealImg);
 
     // Create visible canvas for final output
     const outputCanvas = document.createElement('canvas');
     outputCanvas.width = width;
     outputCanvas.height = height;
+    outputCanvas.style.position = 'absolute';
+    outputCanvas.style.top = '0';
+    outputCanvas.style.left = '0';
     outputCanvas.style.width = '100%';
     outputCanvas.style.height = '100%';
     container.appendChild(outputCanvas);
@@ -33,22 +48,33 @@ const KikiUrchin = () => {
     // Mouse tracking
     let mouseX = -1000;
     let mouseY = -1000;
-    const maskRadius = 60;
-    const grainSize = 3;
+    const maskRadius = 120;
+    const grainSize = 1;
 
     const handleMouseMove = (e) => {
       const rect = outputCanvas.getBoundingClientRect();
-      mouseX = e.clientX - rect.left;
-      mouseY = e.clientY - rect.top;
+      // Scale mouse position to canvas coordinates
+      const scaleX = width / rect.width;
+      const scaleY = height / rect.height;
+      mouseX = (e.clientX - rect.left) * scaleX;
+      mouseY = (e.clientY - rect.top) * scaleY;
     };
 
-    const handleMouseLeave = () => {
-      mouseX = -1000;
-      mouseY = -1000;
-    };
+    // Track mouse globally so mask works near the container edges
+    document.addEventListener('mousemove', handleMouseMove);
 
-    outputCanvas.addEventListener('mousemove', handleMouseMove);
-    outputCanvas.addEventListener('mouseleave', handleMouseLeave);
+    // Audio playback on click
+    let audioElement = null;
+    const handleClick = () => {
+      if (audioElement) {
+        audioElement.pause();
+        audioElement.currentTime = 0;
+      }
+      audioElement = new Audio('/audio/kiki.wav');
+      audioElement.play().catch(err => console.log('Audio play failed:', err));
+    };
+    outputCanvas.addEventListener('click', handleClick);
+    outputCanvas.style.cursor = 'pointer';
 
     // Scene setup
     const scene = new THREE.Scene();
@@ -147,11 +173,6 @@ const KikiUrchin = () => {
     directionalLight2.position.set(-5, -2, -5);
     scene.add(directionalLight2);
 
-    // Halftone settings
-    const cols = 40;
-    const gridStep = width / cols;
-    const cellSize = gridStep;
-
     // Pre-generate noise pattern for grainy mask edge
     const noiseSize = 256;
     const noiseData = new Float32Array(noiseSize * noiseSize);
@@ -164,6 +185,15 @@ const KikiUrchin = () => {
     const animate = () => {
       animationId = requestAnimationFrame(animate);
 
+      // Use current dimensions
+      const w = width;
+      const h = height;
+
+      // Halftone settings (recalculate each frame to handle resize)
+      const cols = 40;
+      const gridStep = w / cols;
+      const cellSize = gridStep;
+
       // Rotate the urchin
       urchinGroup.rotation.y += 0.01;
       urchinGroup.rotation.x = 0.2;
@@ -173,15 +203,15 @@ const KikiUrchin = () => {
 
       // Read pixels from WebGL renderer
       const gl = renderer.getContext();
-      const pixels = new Uint8Array(width * height * 4);
-      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      const pixels = new Uint8Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
 
       // Draw original render to renderCanvas (flip Y)
-      const imageData = renderCtx.createImageData(width, height);
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const srcIdx = ((height - 1 - y) * width + x) * 4;
-          const dstIdx = (y * width + x) * 4;
+      const imageData = renderCtx.createImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const srcIdx = ((h - 1 - y) * w + x) * 4;
+          const dstIdx = (y * w + x) * 4;
           imageData.data[dstIdx] = pixels[srcIdx];
           imageData.data[dstIdx + 1] = pixels[srcIdx + 1];
           imageData.data[dstIdx + 2] = pixels[srcIdx + 2];
@@ -192,19 +222,19 @@ const KikiUrchin = () => {
 
       // Draw halftone
       halftoneCtx.fillStyle = '#000';
-      halftoneCtx.fillRect(0, 0, width, height);
+      halftoneCtx.fillRect(0, 0, w, h);
       halftoneCtx.fillStyle = '#888';
 
-      const visibleRows = Math.ceil(height / gridStep) + 1;
+      const visibleRows = Math.ceil(h / gridStep) + 1;
       const steps = 5;
 
       for (let row = 0; row < visibleRows; row++) {
         for (let col = 0; col < cols; col++) {
           const sampleX = Math.floor(col * gridStep + gridStep / 2);
-          const sampleY = height - 1 - Math.floor(row * gridStep + gridStep / 2);
+          const sampleY = h - 1 - Math.floor(row * gridStep + gridStep / 2);
 
-          if (sampleX >= 0 && sampleX < width && sampleY >= 0 && sampleY < height) {
-            const pixelIndex = (sampleY * width + sampleX) * 4;
+          if (sampleX >= 0 && sampleX < w && sampleY >= 0 && sampleY < h) {
+            const pixelIndex = (sampleY * w + sampleX) * 4;
             const r = pixels[pixelIndex];
             const g = pixels[pixelIndex + 1];
             const b = pixels[pixelIndex + 2];
@@ -229,11 +259,10 @@ const KikiUrchin = () => {
 
       // Apply grainy mask to reveal original render around cursor
       if (mouseX > -500 && mouseY > -500) {
-        const outputData = outputCtx.getImageData(0, 0, width, height);
-        const renderData = renderCtx.getImageData(0, 0, width, height);
+        const outputData = outputCtx.getImageData(0, 0, w, h);
 
-        for (let py = 0; py < height; py += grainSize) {
-          for (let px = 0; px < width; px += grainSize) {
+        for (let py = 0; py < h; py += grainSize) {
+          for (let px = 0; px < w; px += grainSize) {
             const dx = px - mouseX;
             const dy = py - mouseY;
             const dist = Math.sqrt(dx * dx + dy * dy);
@@ -245,9 +274,9 @@ const KikiUrchin = () => {
 
             if (dist < effectiveRadius) {
               // Make pixels transparent to reveal what's underneath
-              for (let gy = 0; gy < grainSize && py + gy < height; gy++) {
-                for (let gx = 0; gx < grainSize && px + gx < width; gx++) {
-                  const idx = ((py + gy) * width + (px + gx)) * 4;
+              for (let gy = 0; gy < grainSize && py + gy < h; gy++) {
+                for (let gx = 0; gx < grainSize && px + gx < w; gx++) {
+                  const idx = ((py + gy) * w + (px + gx)) * 4;
                   outputData.data[idx + 3] = 0; // Set alpha to 0
                 }
               }
@@ -266,6 +295,11 @@ const KikiUrchin = () => {
       const newWidth = container.offsetWidth;
       const newHeight = container.offsetHeight;
 
+      if (newWidth === 0 || newHeight === 0) return;
+
+      width = newWidth;
+      height = newHeight;
+
       outputCanvas.width = newWidth;
       outputCanvas.height = newHeight;
       halftoneCanvas.width = newWidth;
@@ -280,14 +314,26 @@ const KikiUrchin = () => {
 
     window.addEventListener('resize', handleResize);
 
+    // Also handle initial size after layout settles
+    const resizeObserver = new ResizeObserver(() => {
+      handleResize();
+    });
+    resizeObserver.observe(container);
+
     // Cleanup
     return () => {
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', handleResize);
-      outputCanvas.removeEventListener('mousemove', handleMouseMove);
-      outputCanvas.removeEventListener('mouseleave', handleMouseLeave);
+      resizeObserver.disconnect();
+      document.removeEventListener('mousemove', handleMouseMove);
+      outputCanvas.removeEventListener('click', handleClick);
+      if (audioElement) {
+        audioElement.pause();
+        audioElement = null;
+      }
       renderer.dispose();
       container.removeChild(outputCanvas);
+      container.removeChild(revealImg);
     };
   }, []);
 

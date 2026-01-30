@@ -7,9 +7,8 @@
  * Draw sampling points on a canvas overlay
  * @param {HTMLCanvasElement} canvas - Canvas to draw on
  * @param {Array<{x: number, y: number}>} points - Array of {x, y} coordinates
- * @param {string} color - Color for the points (default: 'rgba(255, 255, 0, 0.8)')
  */
-export const drawSamplingPoints = (canvas, points, color = 'rgba(255, 255, 0, 0.8)') => {
+export const drawSamplingPoints = (canvas, points) => {
   if (!canvas || !points || points.length === 0) return;
 
   const ctx = canvas.getContext('2d');
@@ -17,23 +16,26 @@ export const drawSamplingPoints = (canvas, points, color = 'rgba(255, 255, 0, 0.
 
   ctx.save();
 
-  // Draw points
   points.forEach((point, index) => {
-    // Draw outer circle
+    const { x, y } = point;
+
+    // White filled circle
     ctx.beginPath();
-    ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
-    ctx.fillStyle = color;
+    ctx.arc(x, y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
     ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-    ctx.lineWidth = 2;
+
+    // 1px black border
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
     ctx.stroke();
 
-    // Draw index number
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-    ctx.font = 'bold 10px sans-serif';
+    // Black number
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 9px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(index + 1, point.x, point.y);
+    ctx.fillText(String(index + 1), x, y);
   });
 
   ctx.restore();

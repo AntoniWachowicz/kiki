@@ -8,6 +8,25 @@ When working on sound generation improvements, **only edit `src/soundGenerationV
 
 ---
 
+## Regenerating Showcase Audio Files
+
+The showcase page (`/showcase`) plays pre-generated audio when users click on the Bouba/Kiki 3D renders. These audio files are stored in `public/audio/` and must be regenerated whenever:
+
+1. **The example images change** (`public/examples/bouba.jpg` or `public/examples/kiki.jpg`)
+2. **The sound generation engine is updated** (`src/soundGenerationLegacy.js` or the engine being used)
+3. **The image analysis algorithm changes** (`src/imageAnalysis.js` or `src/angularityAnalysis.js`)
+
+### How to Regenerate
+
+1. Start the dev server: `npm run dev`
+2. Navigate to `/dev` (Dev Tools page)
+3. Click "Generate All" to download both `bouba.wav` and `kiki.wav`
+4. Move the downloaded files to `public/audio/`
+
+The audio export utility (`src/audioExport.js`) uses `OfflineAudioContext` to render the same sound generation algorithm to WAV files.
+
+---
+
 ## Overview
 An interactive web application that translates visual properties of images into sound, based on the psychological Bouba/Kiki effect. The project explores cross-sensory perception by mapping shape characteristics (rounded vs. angular), color, texture, and complexity into corresponding audio properties.
 
@@ -127,7 +146,7 @@ Uses Web Audio API with two distinct modes:
 ```
 O:\jsc\bouba\
 ├── src/
-│   ├── App.jsx                    # Main component with all logic
+│   ├── App.jsx                    # Main router component
 │   ├── main.jsx                   # React entry point
 │   ├── index.css                  # Tailwind imports
 │   ├── imageAnalysis.js           # Visual property extraction
@@ -136,8 +155,20 @@ O:\jsc\bouba\
 │   ├── soundGeneration.js         # Original sound module (can be removed)
 │   ├── soundGenerationLegacy.js   # PRESERVED - Do not edit!
 │   ├── soundGenerationV2.js       # Experimental - Edit this one
-│   └── visualizationUtils.js      # Sampling point rendering
-├── public/examples/       # Example images
+│   ├── audioExport.js             # WAV export using OfflineAudioContext
+│   ├── visualizationUtils.js      # Sampling point rendering
+│   ├── pages/
+│   │   ├── HomePage.jsx           # Landing page
+│   │   ├── ShowcasePage.jsx       # 3D renders with click-to-play audio
+│   │   ├── AppPage.jsx            # Main image analysis app
+│   │   └── DevToolsPage.jsx       # Audio generation dev tools
+│   └── components/
+│       ├── BoubaBlob.jsx          # 3D blob with halftone + reveal mask
+│       ├── KikiUrchin.jsx         # 3D urchin with halftone + reveal mask
+│       └── NoiseAnimation.jsx     # Background animation
+├── public/
+│   ├── examples/          # Example images (bouba.jpg, kiki.jpg)
+│   └── audio/             # Pre-generated audio (bouba.wav, kiki.wav)
 ├── dist/                  # Build output
 ├── index.html             # HTML entry point
 ├── package.json           # Dependencies
