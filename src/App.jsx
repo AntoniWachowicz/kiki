@@ -4,6 +4,7 @@ import HomePage from './pages/HomePage';
 import ShowcasePage from './pages/ShowcasePage';
 import AppPage from './pages/AppPage';
 import DevToolsPage from './pages/DevToolsPage';
+import ReversePage from './pages/ReversePage';
 
 const App = () => {
   return (
@@ -12,6 +13,7 @@ const App = () => {
       <Route path="/showcase" element={<ShowcasePage />} />
       <Route path="/app" element={<AppPage />} />
       <Route path="/dev" element={<DevToolsPage />} />
+      <Route path="/reverse" element={<ReversePage />} />
     </Routes>
   );
 };
