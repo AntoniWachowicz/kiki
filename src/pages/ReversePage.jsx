@@ -25,6 +25,7 @@ const ReversePage = () => {
   const [sourceLabel, setSourceLabel] = useState('manual');
   const [audioUrl, setAudioUrl] = useState(null);
   const [generator, setGenerator] = useState('voronoi');
+  const [urlInput, setUrlInput] = useState('');
   // DEBUG: temp overlay showing band levels / onsets / centroid crosses on
   // top of the particle field. Remove this state + the toggle button + the
   // setDebug effect when we're done diagnosing motion.
@@ -108,11 +109,18 @@ const ReversePage = () => {
     // we replay thousands of frames in one go on a long backward seek.
     const levelBuf = [0, 0, 0];
     const fluxBuf = [0, 0, 0];
+    const centroidBuf = [0.5, 0.5, 0.5];
+    // [normalized pitch in [0, 1], confidence in [0, 1]] — drives mid
+    // stripe Y in the stipple sim.
+    const pitchBuf = [0.5, 0];
     const readFrameAt = (idx) => {
       const tl = timelineRef.current;
       if (!tl || tl.frameCount === 0) {
         levelBuf[0] = levelBuf[1] = levelBuf[2] = 0;
         fluxBuf[0] = fluxBuf[1] = fluxBuf[2] = 0;
+        centroidBuf[0] = centroidBuf[1] = centroidBuf[2] = 0.5;
+        pitchBuf[0] = 0.5;
+        pitchBuf[1] = 0;
         return;
       }
       // Clamp to the valid range so the very last bands hold steady when
@@ -125,6 +133,17 @@ const ReversePage = () => {
       fluxBuf[0] = tl.flux[off];
       fluxBuf[1] = tl.flux[off + 1];
       fluxBuf[2] = tl.flux[off + 2];
+      // Older sessions may not have centroids; default to band centre.
+      const c = tl.centroids;
+      if (c) {
+        centroidBuf[0] = c[off];
+        centroidBuf[1] = c[off + 1];
+        centroidBuf[2] = c[off + 2];
+      } else {
+        centroidBuf[0] = centroidBuf[1] = centroidBuf[2] = 0.5;
+      }
+      pitchBuf[0] = tl.pitches ? tl.pitches[i] : 0.5;
+      pitchBuf[1] = tl.confidences ? tl.confidences[i] : 0;
     };
 
     const syncTo = (targetIdx) => {
@@ -142,7 +161,7 @@ const ReversePage = () => {
       while (last < targetIdx) {
         last++;
         readFrameAt(last);
-        session.update(levelBuf, fluxBuf);
+        session.update(levelBuf, fluxBuf, centroidBuf, pitchBuf);
         stepped = true;
       }
       lastFrameIdxRef.current = last;
@@ -271,6 +290,58 @@ const ReversePage = () => {
     }
   };
 
+  // Fetch any direct audio URL and run it through the pipeline. Browsers
+  // block YouTube / Spotify / SoundCloud streams via CORS + DRM, so this
+  // only works for hosts that serve a direct .mp3/.wav/.ogg/etc. file with
+  // permissive CORS headers (archive.org, FMA, Pixabay, ccMixter, etc.).
+  const loadFromUrl = async () => {
+    const raw = urlInput.trim();
+    if (!raw) return;
+    setError(null);
+
+    // Friendly bounce for known unsupported sources rather than the generic
+    // "failed to fetch" we'd get from CORS.
+    if (/youtu\.?be|spotify|soundcloud|apple\.com\/.*music/i.test(raw)) {
+      setError(
+        "Streaming services don't expose audio to browsers. Paste a direct .mp3/.wav URL (try archive.org, Pixabay, ccMixter)."
+      );
+      return;
+    }
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      setError("That doesn't look like a valid URL.");
+      return;
+    }
+
+    setStatus('fetching');
+    try {
+      const res = await fetch(raw);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      // Bail before downloading a multi-hundred-MB file.
+      const lenHeader = res.headers.get('content-length');
+      if (lenHeader && parseInt(lenHeader, 10) > 50 * 1024 * 1024) {
+        throw new Error('Audio is larger than 50 MB.');
+      }
+      const arrayBuffer = await res.arrayBuffer();
+      const filename = parsed.pathname.split('/').pop() || parsed.hostname;
+      const label = filename.split('?')[0].replace(/\.[a-z0-9]+$/i, '') || 'remote-audio';
+      await runPipeline(arrayBuffer, label, res.headers.get('content-type'));
+    } catch (err) {
+      // A bare TypeError from fetch nearly always means CORS, since the
+      // browser surfaces network/CORS failures the same way.
+      if (err instanceof TypeError) {
+        setError(
+          "Couldn't fetch that URL — most likely the host blocks cross-origin requests (CORS). Try a different one."
+        );
+      } else {
+        setError(err.message || 'Failed to load URL');
+      }
+      setStatus('idle');
+    }
+  };
+
   const updateFeature = (key, value) => {
     setFeatures((prev) => ({ ...prev, [key]: value }));
   };
@@ -295,7 +366,7 @@ const ReversePage = () => {
     }, 'image/png');
   };
 
-  const isBusy = status === 'decoding' || status === 'analyzing';
+  const isBusy = status === 'fetching' || status === 'decoding' || status === 'analyzing';
 
   return (
     <div className="min-h-screen bg-black p-8 lg:p-12">
@@ -407,6 +478,25 @@ const ReversePage = () => {
               </button>
             </div>
 
+            <div className="flex gap-3 mb-6">
+              <input
+                type="text"
+                placeholder="Paste a direct audio URL (.mp3, .wav, .ogg, ...)"
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') loadFromUrl(); }}
+                disabled={isBusy}
+                className="flex-1 px-4 py-3 bg-black border border-white/30 text-white placeholder-white/30 focus:outline-none focus:border-white/60 disabled:opacity-50"
+              />
+              <button
+                onClick={loadFromUrl}
+                disabled={isBusy || !urlInput.trim()}
+                className="px-6 py-3 border border-white/30 text-white/70 font-semibold hover:bg-white/10 hover:text-white transition-colors disabled:opacity-50"
+              >
+                Load URL
+              </button>
+            </div>
+
             <input
               ref={fileInputRef}
               type="file"
@@ -436,6 +526,7 @@ const ReversePage = () => {
 
             {isBusy && (
               <p className="mt-4 text-white/50 font-mono text-sm animate-pulse">
+                {status === 'fetching' && 'Fetching audio...'}
                 {status === 'decoding' && 'Decoding audio...'}
                 {status === 'analyzing' && 'Extracting features...'}
               </p>

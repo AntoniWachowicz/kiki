@@ -43,20 +43,31 @@ export async function analyzeAudioFile(input) {
 // the same currentTime always produces the same bands, so we can scrub,
 // restart, or replay without the visuals drifting.
 //
-// Two streams per band:
-//   levels  — log-mapped energy. Drives sustained pull strength.
-//   flux    — sum of positive bin deltas vs. the previous frame. Drives onset
-//             detection: a kick drum produces a flux spike in the bass band,
-//             a hi-hat in treble, etc. Distinguishing transients from sustain
-//             is the whole point — without it, a steady loud bassline and a
-//             kick drum trigger the visualizer identically.
+// Streams per frame:
+//   levels[3]    — per-band log-mapped energy. Drives sustained pull.
+//   flux[3]      — per-band sum of positive bin deltas. Drives onset
+//                  detection: a kick drum produces a flux spike in bass,
+//                  a hi-hat in treble. Distinguishing transients from
+//                  sustain — without it, a steady loud bassline and a
+//                  kick drum trigger the visualizer identically.
+//   centroids[3] — per-band normalized spectral centroid in [0, 1]. The
+//                  mid centroid drives the mid stripe's horizontal axis.
+//   pitches      — single normalized pitch per frame (Harmonic Product
+//                  Spectrum on 80–1300 Hz, log-mapped to [0, 1] over four
+//                  octaves). Drives the mid stripe's vertical Y target so
+//                  the stripe traces the melody.
+//   confidences  — pitch confidence in [0, 1]. Low = no clear melody, the
+//                  Y target falls back to the slow curl-flow bob.
 function computeBandsTimeline(samples, sampleRate) {
   Meyda.bufferSize = FRAME_SIZE;
   const frameRate = sampleRate / HOP_SIZE;
   const totalFrames = Math.max(0, Math.floor((samples.length - FRAME_SIZE) / HOP_SIZE) + 1);
   const levels = new Float32Array(totalFrames * 3);
   const flux = new Float32Array(totalFrames * 3);
-  if (totalFrames === 0) return { levels, flux, frameRate, frameCount: 0 };
+  const centroids = new Float32Array(totalFrames * 3);
+  const pitches = new Float32Array(totalFrames);
+  const confidences = new Float32Array(totalFrames);
+  if (totalFrames === 0) return { levels, flux, centroids, pitches, confidences, frameRate, frameCount: 0 };
 
   // Match the live splits used previously (~1.5 kHz, ~6 kHz) so the existing
   // tunings stay in the same neighbourhood.
@@ -88,6 +99,63 @@ function computeBandsTimeline(samples, sampleRate) {
     return sum / Math.max(1, e - s);
   };
 
+  // Normalized centroid within [s, e). den<eps means the band is silent —
+  // return 0.5 (band centre) so the visualizer's horizontal target stays
+  // centred when there's no signal to point at.
+  const bandCentroid = (spec, s, e) => {
+    let num = 0;
+    let den = 0;
+    for (let k = s; k < e; k++) {
+      const a = spec[k];
+      num += k * a;
+      den += a;
+    }
+    if (den < 1e-9) return 0.5;
+    const span = Math.max(1, e - s);
+    const c = (num / den - s) / span;
+    return c < 0 ? 0 : c > 1 ? 1 : c;
+  };
+
+  // Pitch detection via Harmonic Product Spectrum. For each candidate
+  // bin k in the melodic range, score = spec[k]·spec[2k]·spec[3k]. A
+  // real fundamental scores high because all three harmonics are
+  // present; an isolated harmonic (no fundamental at k) scores low. The
+  // strongest score wins. Returns [normalised pitch, confidence] both
+  // in [0, 1]. Confidence is the peak's prominence vs. the band's mean
+  // spectral amplitude, ramped from 0 (peak ≤ 2× mean) to 1 (≥ 6× mean).
+  const PITCH_MIN_HZ = 80;    // E2 — covers male vocal / low melody fundamentals
+  const PITCH_MAX_HZ = 1300;  // ~E6 — covers female vocal / lead instruments
+  const PITCH_LOG_SPAN = Math.log2(PITCH_MAX_HZ / PITCH_MIN_HZ);  // ≈ 4 octaves
+  const pitchMinBin = Math.max(2, Math.floor(PITCH_MIN_HZ / binWidth));
+  const pitchMaxBin = Math.min(halfBins - 1, Math.ceil(PITCH_MAX_HZ / binWidth));
+  const detectPitch = (spec) => {
+    let bestScore = 0;
+    let bestBin = -1;
+    for (let k = pitchMinBin; k <= pitchMaxBin; k++) {
+      if (k * 3 >= halfBins) break;
+      const score = spec[k] * spec[k * 2] * spec[k * 3];
+      if (score > bestScore) {
+        bestScore = score;
+        bestBin = k;
+      }
+    }
+    if (bestBin < 0 || bestScore < 1e-12) return [0.5, 0];
+
+    const pitchHz = bestBin * binWidth;
+    const pitchNorm = Math.log2(pitchHz / PITCH_MIN_HZ) / PITCH_LOG_SPAN;
+    const pitch = pitchNorm < 0 ? 0 : pitchNorm > 1 ? 1 : pitchNorm;
+
+    // HPS score is an amplitude-cubed; cube root to compare with the
+    // band's mean amplitude on the same scale.
+    const peakAmp = Math.cbrt(bestScore);
+    let meanAmp = 0;
+    for (let k = pitchMinBin; k <= pitchMaxBin; k++) meanAmp += spec[k];
+    meanAmp /= Math.max(1, pitchMaxBin - pitchMinBin + 1);
+    const ratio = peakAmp / (meanAmp + 1e-9);
+    const conf = ratio < 2 ? 0 : ratio > 6 ? 1 : (ratio - 2) / 4;
+    return [pitch, conf];
+  };
+
   let prevSpec = null;
   let frameIdx = 0;
   for (let i = 0; i + FRAME_SIZE <= samples.length; i += HOP_SIZE) {
@@ -105,6 +173,12 @@ function computeBandsTimeline(samples, sampleRate) {
       levels[off + 0] = toLevel(bandMean(spec, 0, bassMaxBin));
       levels[off + 1] = toLevel(bandMean(spec, bassMaxBin, midMaxBin));
       levels[off + 2] = toLevel(bandMean(spec, midMaxBin, halfBins));
+      centroids[off + 0] = bandCentroid(spec, 0, bassMaxBin);
+      centroids[off + 1] = bandCentroid(spec, bassMaxBin, midMaxBin);
+      centroids[off + 2] = bandCentroid(spec, midMaxBin, halfBins);
+      const [pitch, conf] = detectPitch(spec);
+      pitches[frameIdx] = pitch;
+      confidences[frameIdx] = conf;
       if (prevSpec) {
         flux[off + 0] = bandFlux(spec, prevSpec, 0, bassMaxBin);
         flux[off + 1] = bandFlux(spec, prevSpec, bassMaxBin, midMaxBin);
@@ -113,11 +187,17 @@ function computeBandsTimeline(samples, sampleRate) {
       // Reuse the buffer to avoid per-frame allocation on long files.
       if (!prevSpec || prevSpec.length !== spec.length) prevSpec = new Float32Array(spec.length);
       prevSpec.set(spec);
+    } else {
+      centroids[frameIdx * 3 + 0] = 0.5;
+      centroids[frameIdx * 3 + 1] = 0.5;
+      centroids[frameIdx * 3 + 2] = 0.5;
+      pitches[frameIdx] = 0.5;
+      confidences[frameIdx] = 0;
     }
     frameIdx++;
   }
 
-  return { levels, flux, frameRate, frameCount: totalFrames };
+  return { levels, flux, centroids, pitches, confidences, frameRate, frameCount: totalFrames };
 }
 
 function toMono(audioBuffer) {
