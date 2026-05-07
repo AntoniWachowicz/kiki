@@ -25,16 +25,22 @@ const ReversePage = () => {
   const [sourceLabel, setSourceLabel] = useState('manual');
   const [audioUrl, setAudioUrl] = useState(null);
   const [generator, setGenerator] = useState('voronoi');
+  // DEBUG: temp overlay showing band levels / onsets / centroid crosses on
+  // top of the particle field. Remove this state + the toggle button + the
+  // setDebug effect when we're done diagnosing motion.
+  const [showDebug, setShowDebug] = useState(true);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const audioUrlRef = useRef(null);
   const audioRef = useRef(null);
   const stippleSessionRef = useRef(null);
   const rafRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const audioSourceRef = useRef(null);
-  const analyserRef = useRef(null);
-  const analyserDataRef = useRef(null);
+  // Per-hop [bass, mid, treble] for the whole file, plus its frame rate.
+  // Lookup table that drives the sim instead of a live AnalyserNode.
+  const timelineRef = useRef(null);
+  // The last sim frame index applied to the session. -1 means "session is at
+  // its initial reset state, no frames stepped yet."
+  const lastFrameIdxRef = useRef(-1);
 
   useEffect(() => {
     return () => {
@@ -65,15 +71,32 @@ const ReversePage = () => {
     try {
       const session = createStippleSession(features, seed, CANVAS_SIZE, CANVAS_SIZE);
       stippleSessionRef.current = session;
-      // Cheap default: bg + initial dots. The sim only advances while audio
-      // is playing; feature changes just reset particle positions.
+      // DEBUG: re-apply the toggle on a freshly-created session.
+      if (session.setDebug) session.setDebug(showDebug);
+      // Fresh session is at its reset state — no frames applied yet.
+      lastFrameIdxRef.current = -1;
       session.draw(ctx);
     } catch (err) {
       console.error('Stipple session failed:', err);
     }
   }, [features, seed, generator]);
 
-  // Drive the stipple simulation from live audio bands while it's playing.
+  // DEBUG: when the toggle changes, reflect it on the current session and
+  // force a redraw so it's visible even while audio is paused.
+  useEffect(() => {
+    if (generator !== 'stipple') return;
+    const session = stippleSessionRef.current;
+    const canvas = canvasRef.current;
+    if (!session || !canvas || !session.setDebug) return;
+    session.setDebug(showDebug);
+    session.draw(canvas.getContext('2d'));
+  }, [showDebug, generator]);
+
+  // Drive the stipple simulation from a pre-computed bands timeline so playback
+  // is fully deterministic w.r.t. audio.currentTime. Seeking backward resets
+  // the session and replays from frame 0 to the target; seeking forward steps
+  // through the bands it skipped over. End-of-track replay works for free —
+  // a fresh play starts at currentTime ≈ 0, which triggers a reset.
   useEffect(() => {
     if (generator !== 'stipple') return;
     const audio = audioRef.current;
@@ -81,96 +104,110 @@ const ReversePage = () => {
     if (!audio || !canvas) return;
     const ctx = canvas.getContext('2d');
 
-    // Lazily build AudioContext → MediaElementSource → Analyser → destination.
-    // Web Audio requires a user gesture (play), so we set this up on play.
-    const ensureAudioGraph = () => {
-      if (audioSourceRef.current) return;
-      try {
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const actx = new AudioCtx();
-        const source = actx.createMediaElementSource(audio);
-        const analyser = actx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.7;
-        source.connect(analyser);
-        analyser.connect(actx.destination);
-        audioCtxRef.current = actx;
-        audioSourceRef.current = source;
-        analyserRef.current = analyser;
-        analyserDataRef.current = new Uint8Array(analyser.frequencyBinCount);
-      } catch (err) {
-        console.error('AudioContext setup failed:', err);
+    // Scratch buffers reused every frame to avoid per-step allocation when
+    // we replay thousands of frames in one go on a long backward seek.
+    const levelBuf = [0, 0, 0];
+    const fluxBuf = [0, 0, 0];
+    const readFrameAt = (idx) => {
+      const tl = timelineRef.current;
+      if (!tl || tl.frameCount === 0) {
+        levelBuf[0] = levelBuf[1] = levelBuf[2] = 0;
+        fluxBuf[0] = fluxBuf[1] = fluxBuf[2] = 0;
+        return;
       }
+      // Clamp to the valid range so the very last bands hold steady when
+      // currentTime runs slightly past the last analysed hop.
+      const i = idx < 0 ? 0 : idx >= tl.frameCount ? tl.frameCount - 1 : idx;
+      const off = i * 3;
+      levelBuf[0] = tl.levels[off];
+      levelBuf[1] = tl.levels[off + 1];
+      levelBuf[2] = tl.levels[off + 2];
+      fluxBuf[0] = tl.flux[off];
+      fluxBuf[1] = tl.flux[off + 1];
+      fluxBuf[2] = tl.flux[off + 2];
     };
 
-    const readBands = () => {
-      const analyser = analyserRef.current;
-      const data = analyserDataRef.current;
-      if (!analyser || !data) return [0, 0, 0];
-      analyser.getByteFrequencyData(data);
-      const n = data.length;
-      // Rough splits for 3 bands. fftSize 256 → 128 bins spanning 0–22 kHz.
-      // bass  ≈ 0–1.4 kHz, mid ≈ 1.4–6 kHz, treble ≈ 6+ kHz.
-      const b1 = Math.floor(n * 0.08);
-      const b2 = Math.floor(n * 0.35);
-      const avg = (s, e) => {
-        let sum = 0;
-        for (let i = s; i < e; i++) sum += data[i];
-        return sum / Math.max(1, e - s) / 255;
-      };
-      return [avg(0, b1), avg(b1, b2), avg(b2, n)];
-    };
-
-    const tick = () => {
+    const syncTo = (targetIdx) => {
       const session = stippleSessionRef.current;
       if (!session) return;
-      session.update(readBands());
-      session.draw(ctx);
+      let last = lastFrameIdxRef.current;
+      let stepped = false;
+      // Backward jump: only way to land at an earlier frame is to replay from
+      // the start. The sim is forward-only and stateful.
+      if (targetIdx < last) {
+        session.reset();
+        last = -1;
+        stepped = true;
+      }
+      while (last < targetIdx) {
+        last++;
+        readFrameAt(last);
+        session.update(levelBuf, fluxBuf);
+        stepped = true;
+      }
+      lastFrameIdxRef.current = last;
+      if (stepped) session.draw(ctx);
+    };
+
+    const targetFrame = () => {
+      const tl = timelineRef.current;
+      if (!tl) return -1;
+      return Math.floor(audio.currentTime * tl.frameRate);
+    };
+
+    const loop = () => {
+      syncTo(targetFrame());
       if (!audio.paused && !audio.ended) {
-        rafRef.current = requestAnimationFrame(tick);
+        rafRef.current = requestAnimationFrame(loop);
+      } else {
+        rafRef.current = null;
       }
     };
 
-    const startLoop = () => {
-      ensureAudioGraph();
-      if (audioCtxRef.current?.state === 'suspended') {
-        audioCtxRef.current.resume();
+    const onPlay = () => {
+      if (rafRef.current == null) {
+        rafRef.current = requestAnimationFrame(loop);
       }
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(tick);
     };
-    const stopLoop = () => {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+    const onStop = () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      // Snap the visuals to wherever the player ended up (matters for the
+      // pause that fires alongside a scrub-while-playing).
+      syncTo(targetFrame());
+    };
+    const onSeeked = () => {
+      syncTo(targetFrame());
+      if (!audio.paused && !audio.ended && rafRef.current == null) {
+        rafRef.current = requestAnimationFrame(loop);
+      }
     };
 
-    audio.addEventListener('play', startLoop);
-    audio.addEventListener('pause', stopLoop);
-    audio.addEventListener('ended', stopLoop);
+    audio.addEventListener('play', onPlay);
+    audio.addEventListener('pause', onStop);
+    audio.addEventListener('ended', onStop);
+    audio.addEventListener('seeked', onSeeked);
 
-    if (!audio.paused) startLoop();
+    // Initial sync for the case where this effect mounts after the user is
+    // already partway through (e.g. switching generators mid-playback).
+    syncTo(targetFrame());
+    if (!audio.paused && !audio.ended) {
+      rafRef.current = requestAnimationFrame(loop);
+    }
 
     return () => {
-      stopLoop();
-      audio.removeEventListener('play', startLoop);
-      audio.removeEventListener('pause', stopLoop);
-      audio.removeEventListener('ended', stopLoop);
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      audio.removeEventListener('play', onPlay);
+      audio.removeEventListener('pause', onStop);
+      audio.removeEventListener('ended', onStop);
+      audio.removeEventListener('seeked', onSeeked);
     };
   }, [generator, audioUrl]);
-
-  // Tear down the AudioContext when the audio element is replaced so the
-  // next upload can bind a fresh MediaElementSource.
-  useEffect(() => {
-    return () => {
-      if (audioCtxRef.current) {
-        audioCtxRef.current.close().catch(() => {});
-      }
-      audioCtxRef.current = null;
-      audioSourceRef.current = null;
-      analyserRef.current = null;
-      analyserDataRef.current = null;
-    };
-  }, [audioUrl]);
 
   const setAudioBlob = (blob) => {
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
@@ -186,7 +223,12 @@ const ReversePage = () => {
       setAudioBlob(new Blob([arrayBuffer], { type: mimeType || 'audio/wav' }));
 
       setStatus('analyzing');
-      const feat = await analyzeAudioFile(arrayBuffer);
+      const { features: feat, timeline } = await analyzeAudioFile(arrayBuffer);
+      timelineRef.current = timeline;
+      // New file → new session will be built by the session-creation effect
+      // when features change. Reset the cursor so the playback effect knows
+      // there's nothing to step from yet.
+      lastFrameIdxRef.current = -1;
       setFeatures(feat);
       setSourceLabel(label);
       setSeed(hashString(label));
@@ -343,6 +385,19 @@ const ReversePage = () => {
               >
                 Re-seed
               </button>
+              {/* DEBUG: temporary toggle for the audio-state overlay. */}
+              {generator === 'stipple' && (
+                <button
+                  onClick={() => setShowDebug((v) => !v)}
+                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
+                    showDebug
+                      ? 'border-yellow-400/60 text-yellow-300 hover:bg-yellow-400/10'
+                      : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
+                  }`}
+                >
+                  Debug: {showDebug ? 'on' : 'off'}
+                </button>
+              )}
               <button
                 onClick={downloadPng}
                 className="px-6 py-3 border border-white/30 text-white/70 font-semibold hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"

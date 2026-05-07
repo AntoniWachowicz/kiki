@@ -31,7 +31,93 @@ export async function analyzeAudioFile(input) {
     throw new Error('Audio is too short to analyze');
   }
 
-  return aggregate(trimmed, audioBuffer.sampleRate);
+  const features = aggregate(trimmed, audioBuffer.sampleRate);
+  // Timeline is computed on the un-trimmed mono so frame indices align with
+  // the <audio> element's currentTime — the player plays the original file.
+  const timeline = computeBandsTimeline(samples, audioBuffer.sampleRate);
+  return { features, timeline };
+}
+
+// Per-hop band data for the whole file. Driving the sim from this lookup
+// table (instead of a live AnalyserNode) makes playback fully deterministic:
+// the same currentTime always produces the same bands, so we can scrub,
+// restart, or replay without the visuals drifting.
+//
+// Two streams per band:
+//   levels  — log-mapped energy. Drives sustained pull strength.
+//   flux    — sum of positive bin deltas vs. the previous frame. Drives onset
+//             detection: a kick drum produces a flux spike in the bass band,
+//             a hi-hat in treble, etc. Distinguishing transients from sustain
+//             is the whole point — without it, a steady loud bassline and a
+//             kick drum trigger the visualizer identically.
+function computeBandsTimeline(samples, sampleRate) {
+  Meyda.bufferSize = FRAME_SIZE;
+  const frameRate = sampleRate / HOP_SIZE;
+  const totalFrames = Math.max(0, Math.floor((samples.length - FRAME_SIZE) / HOP_SIZE) + 1);
+  const levels = new Float32Array(totalFrames * 3);
+  const flux = new Float32Array(totalFrames * 3);
+  if (totalFrames === 0) return { levels, flux, frameRate, frameCount: 0 };
+
+  // Match the live splits used previously (~1.5 kHz, ~6 kHz) so the existing
+  // tunings stay in the same neighbourhood.
+  const binWidth = sampleRate / FRAME_SIZE;
+  const halfBins = FRAME_SIZE / 2;
+  const bassMaxBin = Math.min(halfBins, Math.max(1, Math.floor(1500 / binWidth)));
+  const midMaxBin = Math.min(halfBins, Math.max(bassMaxBin + 1, Math.floor(6000 / binWidth)));
+
+  // Map linear amplitude → 0..1 via dB, mirroring AnalyserNode's default
+  // -100 dB / -30 dB byte range so values land in the same ballpark.
+  const toLevel = (amp) => {
+    const db = 20 * Math.log10(Math.max(amp, 1e-10));
+    const v = (db + 100) / 70;
+    return v < 0 ? 0 : v > 1 ? 1 : v;
+  };
+
+  const bandMean = (spec, s, e) => {
+    let sum = 0;
+    for (let k = s; k < e; k++) sum += spec[k];
+    return sum / Math.max(1, e - s);
+  };
+
+  const bandFlux = (spec, prev, s, e) => {
+    let sum = 0;
+    for (let k = s; k < e; k++) {
+      const d = spec[k] - prev[k];
+      if (d > 0) sum += d;
+    }
+    return sum / Math.max(1, e - s);
+  };
+
+  let prevSpec = null;
+  let frameIdx = 0;
+  for (let i = 0; i + FRAME_SIZE <= samples.length; i += HOP_SIZE) {
+    const frame = samples.slice(i, i + FRAME_SIZE);
+    let f;
+    try {
+      f = Meyda.extract(['amplitudeSpectrum'], frame);
+    } catch (e) {
+      frameIdx++;
+      continue;
+    }
+    if (f && f.amplitudeSpectrum) {
+      const spec = f.amplitudeSpectrum;
+      const off = frameIdx * 3;
+      levels[off + 0] = toLevel(bandMean(spec, 0, bassMaxBin));
+      levels[off + 1] = toLevel(bandMean(spec, bassMaxBin, midMaxBin));
+      levels[off + 2] = toLevel(bandMean(spec, midMaxBin, halfBins));
+      if (prevSpec) {
+        flux[off + 0] = bandFlux(spec, prevSpec, 0, bassMaxBin);
+        flux[off + 1] = bandFlux(spec, prevSpec, bassMaxBin, midMaxBin);
+        flux[off + 2] = bandFlux(spec, prevSpec, midMaxBin, halfBins);
+      }
+      // Reuse the buffer to avoid per-frame allocation on long files.
+      if (!prevSpec || prevSpec.length !== spec.length) prevSpec = new Float32Array(spec.length);
+      prevSpec.set(spec);
+    }
+    frameIdx++;
+  }
+
+  return { levels, flux, frameRate, frameCount: totalFrames };
 }
 
 function toMono(audioBuffer) {
