@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { Upload, Download, AlertCircle, Play } from 'lucide-react';
 import { analyzeAudioFile } from '../audioAnalysis';
 import { deriveStaticState, deriveFrameState, draw, hashString } from '../voronoiGenerator';
+import { createStippleSession } from '../stippleGenerator';
 
 const CANVAS_SIZE = 1024;
 
@@ -23,9 +24,17 @@ const ReversePage = () => {
   const [error, setError] = useState(null);
   const [sourceLabel, setSourceLabel] = useState('manual');
   const [audioUrl, setAudioUrl] = useState(null);
+  const [generator, setGenerator] = useState('voronoi');
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const audioUrlRef = useRef(null);
+  const audioRef = useRef(null);
+  const stippleSessionRef = useRef(null);
+  const rafRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const audioSourceRef = useRef(null);
+  const analyserRef = useRef(null);
+  const analyserDataRef = useRef(null);
 
   useEffect(() => {
     return () => {
@@ -33,20 +42,135 @@ const ReversePage = () => {
     };
   }, []);
 
-  // Re-render whenever features or seed change — single render path for
-  // both slider edits and audio-driven updates.
+  // Voronoi: render on feature/seed change. Fast and stateless.
+  // Stipple: (re)build a session and show its final trace as the default image.
+  // Playback then drives sim progress from audio.currentTime (see effect below).
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    try {
-      const staticState = deriveStaticState(features, seed, CANVAS_SIZE, CANVAS_SIZE);
-      const frameState = deriveFrameState(staticState, 0);
-      const ctx = canvas.getContext('2d');
-      draw(ctx, frameState);
-    } catch (err) {
-      console.error('Render failed:', err);
+    const ctx = canvas.getContext('2d');
+
+    if (generator === 'voronoi') {
+      stippleSessionRef.current = null;
+      try {
+        const staticState = deriveStaticState(features, seed, CANVAS_SIZE, CANVAS_SIZE);
+        const frameState = deriveFrameState(staticState, 0);
+        draw(ctx, frameState);
+      } catch (err) {
+        console.error('Render failed:', err);
+      }
+      return;
     }
-  }, [features, seed]);
+
+    try {
+      const session = createStippleSession(features, seed, CANVAS_SIZE, CANVAS_SIZE);
+      stippleSessionRef.current = session;
+      // Cheap default: bg + initial dots. The sim only advances while audio
+      // is playing; feature changes just reset particle positions.
+      session.draw(ctx);
+    } catch (err) {
+      console.error('Stipple session failed:', err);
+    }
+  }, [features, seed, generator]);
+
+  // Drive the stipple simulation from live audio bands while it's playing.
+  useEffect(() => {
+    if (generator !== 'stipple') return;
+    const audio = audioRef.current;
+    const canvas = canvasRef.current;
+    if (!audio || !canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    // Lazily build AudioContext → MediaElementSource → Analyser → destination.
+    // Web Audio requires a user gesture (play), so we set this up on play.
+    const ensureAudioGraph = () => {
+      if (audioSourceRef.current) return;
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const actx = new AudioCtx();
+        const source = actx.createMediaElementSource(audio);
+        const analyser = actx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.7;
+        source.connect(analyser);
+        analyser.connect(actx.destination);
+        audioCtxRef.current = actx;
+        audioSourceRef.current = source;
+        analyserRef.current = analyser;
+        analyserDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+      } catch (err) {
+        console.error('AudioContext setup failed:', err);
+      }
+    };
+
+    const readBands = () => {
+      const analyser = analyserRef.current;
+      const data = analyserDataRef.current;
+      if (!analyser || !data) return [0, 0, 0];
+      analyser.getByteFrequencyData(data);
+      const n = data.length;
+      // Rough splits for 3 bands. fftSize 256 → 128 bins spanning 0–22 kHz.
+      // bass  ≈ 0–1.4 kHz, mid ≈ 1.4–6 kHz, treble ≈ 6+ kHz.
+      const b1 = Math.floor(n * 0.08);
+      const b2 = Math.floor(n * 0.35);
+      const avg = (s, e) => {
+        let sum = 0;
+        for (let i = s; i < e; i++) sum += data[i];
+        return sum / Math.max(1, e - s) / 255;
+      };
+      return [avg(0, b1), avg(b1, b2), avg(b2, n)];
+    };
+
+    const tick = () => {
+      const session = stippleSessionRef.current;
+      if (!session) return;
+      session.update(readBands());
+      session.draw(ctx);
+      if (!audio.paused && !audio.ended) {
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    };
+
+    const startLoop = () => {
+      ensureAudioGraph();
+      if (audioCtxRef.current?.state === 'suspended') {
+        audioCtxRef.current.resume();
+      }
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    const stopLoop = () => {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+
+    audio.addEventListener('play', startLoop);
+    audio.addEventListener('pause', stopLoop);
+    audio.addEventListener('ended', stopLoop);
+
+    if (!audio.paused) startLoop();
+
+    return () => {
+      stopLoop();
+      audio.removeEventListener('play', startLoop);
+      audio.removeEventListener('pause', stopLoop);
+      audio.removeEventListener('ended', stopLoop);
+    };
+  }, [generator, audioUrl]);
+
+  // Tear down the AudioContext when the audio element is replaced so the
+  // next upload can bind a fresh MediaElementSource.
+  useEffect(() => {
+    return () => {
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {});
+      }
+      audioCtxRef.current = null;
+      audioSourceRef.current = null;
+      analyserRef.current = null;
+      analyserDataRef.current = null;
+    };
+  }, [audioUrl]);
 
   const setAudioBlob = (blob) => {
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
@@ -137,7 +261,11 @@ const ReversePage = () => {
         <div className="flex justify-between items-start mb-8">
           <div>
             <h1 className="text-4xl lg:text-5xl font-bold text-white mb-2">Sound → Image</h1>
-            <p className="text-white/50">Voronoi generator driven by audio features</p>
+            <p className="text-white/50">
+              {generator === 'voronoi'
+                ? 'Voronoi generator driven by audio features'
+                : 'Particles pulled by live bass / mid / treble energy'}
+            </p>
           </div>
           <Link
             to="/"
@@ -156,6 +284,29 @@ const ReversePage = () => {
 
         <div className="flex flex-col lg:flex-row gap-8 lg:gap-12">
           <div className="lg:w-2/3 flex flex-col">
+            <div className="flex mb-4 border border-white/20 w-fit">
+              <button
+                onClick={() => setGenerator('voronoi')}
+                className={`px-4 py-2 text-sm font-semibold transition-colors ${
+                  generator === 'voronoi'
+                    ? 'bg-white text-black'
+                    : 'text-white/60 hover:text-white'
+                }`}
+              >
+                Voronoi
+              </button>
+              <button
+                onClick={() => setGenerator('stipple')}
+                className={`px-4 py-2 text-sm font-semibold transition-colors ${
+                  generator === 'stipple'
+                    ? 'bg-white text-black'
+                    : 'text-white/60 hover:text-white'
+                }`}
+              >
+                Particle trails
+              </button>
+            </div>
+
             <div className="flex flex-wrap gap-3 mb-6">
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -220,6 +371,8 @@ const ReversePage = () => {
 
             {audioUrl && (
               <audio
+                key={audioUrl}
+                ref={audioRef}
                 src={audioUrl}
                 controls
                 className="w-full mt-4"
@@ -230,6 +383,12 @@ const ReversePage = () => {
               <p className="mt-4 text-white/50 font-mono text-sm animate-pulse">
                 {status === 'decoding' && 'Decoding audio...'}
                 {status === 'analyzing' && 'Extracting features...'}
+              </p>
+            )}
+
+            {generator === 'stipple' && audioUrl && (
+              <p className="mt-2 text-white/40 text-xs">
+                Press play — particles are pulled by live bass / mid / treble energy.
               </p>
             )}
           </div>
