@@ -30,7 +30,31 @@ const ReversePage = () => {
   // top of the particle field. Remove this state + the toggle button + the
   // setDebug effect when we're done diagnosing motion.
   const [showDebug, setShowDebug] = useState(true);
+  // Lock the bass satellites + mid stripe at their seed positions so the
+  // trace canvas isn't dominated by streaks from moving wells.
+  const [stationaryWells, setStationaryWells] = useState(false);
+  // Per-band on/off — disable any band's audio→force coupling entirely.
+  // [bass, mid, treble].
+  const [bandsEnabled, setBandsEnabled] = useState([true, true, true]);
+  const toggleBand = (b) =>
+    setBandsEnabled((prev) => prev.map((v, i) => (i === b ? !v : v)));
+  // Trace channels — compose freely. Particles default on (preserves
+  // existing trace), wells/events default off so the user can layer them
+  // in deliberately.
+  const [traceModes, setTraceModes] = useState({
+    particles: true,
+    wells: false,
+    events: false,
+  });
+  const toggleTraceMode = (mode) =>
+    setTraceModes((prev) => ({ ...prev, [mode]: !prev[mode] }));
   const canvasRef = useRef(null);
+  // Companion canvas. Accumulates line segments from each particle's
+  // previous → current position every frame, never clearing between
+  // frames. Cleared only on reset (new file, generator switch, backward
+  // seek). The animation canvas shows live motion; this one shows the
+  // composite "result image" the motion produces.
+  const traceCanvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const audioUrlRef = useRef(null);
   const audioRef = useRef(null);
@@ -49,6 +73,16 @@ const ReversePage = () => {
     };
   }, []);
 
+  // Helper: paint the trace canvas solid black. Called whenever the sim is
+  // reset so the accumulated traces don't persist across files / seeks.
+  const clearTraceCanvas = () => {
+    const tc = traceCanvasRef.current;
+    if (!tc) return;
+    const tctx = tc.getContext('2d');
+    tctx.fillStyle = '#000';
+    tctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+  };
+
   // Voronoi: render on feature/seed change. Fast and stateless.
   // Stipple: (re)build a session and show its final trace as the default image.
   // Playback then drives sim progress from audio.currentTime (see effect below).
@@ -59,6 +93,7 @@ const ReversePage = () => {
 
     if (generator === 'voronoi') {
       stippleSessionRef.current = null;
+      clearTraceCanvas();
       try {
         const staticState = deriveStaticState(features, seed, CANVAS_SIZE, CANVAS_SIZE);
         const frameState = deriveFrameState(staticState, 0);
@@ -74,8 +109,18 @@ const ReversePage = () => {
       stippleSessionRef.current = session;
       // DEBUG: re-apply the toggle on a freshly-created session.
       if (session.setDebug) session.setDebug(showDebug);
+      if (session.setStationaryWells) session.setStationaryWells(stationaryWells);
+      if (session.setBandEnabled) {
+        for (let b = 0; b < 3; b++) session.setBandEnabled(b, bandsEnabled[b]);
+      }
+      if (session.setTraceMode) {
+        for (const m of ['particles', 'wells', 'events']) {
+          session.setTraceMode(m, traceModes[m]);
+        }
+      }
       // Fresh session is at its reset state — no frames applied yet.
       lastFrameIdxRef.current = -1;
+      clearTraceCanvas();
       session.draw(ctx);
     } catch (err) {
       console.error('Stipple session failed:', err);
@@ -93,6 +138,33 @@ const ReversePage = () => {
     session.draw(canvas.getContext('2d'));
   }, [showDebug, generator]);
 
+  // When the stationary-wells toggle flips, push it to the session.
+  // No reset/redraw — the change takes effect from the next sim frame.
+  useEffect(() => {
+    if (generator !== 'stipple') return;
+    const session = stippleSessionRef.current;
+    if (!session || !session.setStationaryWells) return;
+    session.setStationaryWells(stationaryWells);
+  }, [stationaryWells, generator]);
+
+  // Push per-band enable flags to the session whenever they toggle.
+  useEffect(() => {
+    if (generator !== 'stipple') return;
+    const session = stippleSessionRef.current;
+    if (!session || !session.setBandEnabled) return;
+    for (let b = 0; b < 3; b++) session.setBandEnabled(b, bandsEnabled[b]);
+  }, [bandsEnabled, generator]);
+
+  // Push trace-mode flags whenever they toggle.
+  useEffect(() => {
+    if (generator !== 'stipple') return;
+    const session = stippleSessionRef.current;
+    if (!session || !session.setTraceMode) return;
+    for (const m of ['particles', 'wells', 'events']) {
+      session.setTraceMode(m, traceModes[m]);
+    }
+  }, [traceModes, generator]);
+
   // Drive the stipple simulation from a pre-computed bands timeline so playback
   // is fully deterministic w.r.t. audio.currentTime. Seeking backward resets
   // the session and replays from frame 0 to the target; seeking forward steps
@@ -104,6 +176,8 @@ const ReversePage = () => {
     const canvas = canvasRef.current;
     if (!audio || !canvas) return;
     const ctx = canvas.getContext('2d');
+    const traceCanvas = traceCanvasRef.current;
+    const traceCtx = traceCanvas ? traceCanvas.getContext('2d') : null;
 
     // Scratch buffers reused every frame to avoid per-step allocation when
     // we replay thousands of frames in one go on a long backward seek.
@@ -152,16 +226,22 @@ const ReversePage = () => {
       let last = lastFrameIdxRef.current;
       let stepped = false;
       // Backward jump: only way to land at an earlier frame is to replay from
-      // the start. The sim is forward-only and stateful.
+      // the start. The sim is forward-only and stateful. Trace canvas resets
+      // too — replay from frame 0 will rebuild it as we step forward.
       if (targetIdx < last) {
         session.reset();
         last = -1;
         stepped = true;
+        if (traceCtx) {
+          traceCtx.fillStyle = '#000';
+          traceCtx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        }
       }
       while (last < targetIdx) {
         last++;
         readFrameAt(last);
         session.update(levelBuf, fluxBuf, centroidBuf, pitchBuf);
+        if (traceCtx && session.drawTraces) session.drawTraces(traceCtx);
         stepped = true;
       }
       lastFrameIdxRef.current = last;
@@ -395,8 +475,8 @@ const ReversePage = () => {
           </div>
         )}
 
-        <div className="flex flex-col lg:flex-row gap-8 lg:gap-12">
-          <div className="lg:w-2/3 flex flex-col">
+        <div className="flex flex-col gap-8">
+          <div className="flex flex-col">
             <div className="flex mb-4 border border-white/20 w-fit">
               <button
                 onClick={() => setGenerator('voronoi')}
@@ -469,6 +549,44 @@ const ReversePage = () => {
                   Debug: {showDebug ? 'on' : 'off'}
                 </button>
               )}
+              {generator === 'stipple' && (
+                <button
+                  onClick={() => setStationaryWells((v) => !v)}
+                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
+                    stationaryWells
+                      ? 'border-cyan-400/60 text-cyan-300 hover:bg-cyan-400/10'
+                      : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
+                  }`}
+                >
+                  Wells: {stationaryWells ? 'static' : 'moving'}
+                </button>
+              )}
+              {generator === 'stipple' && ['Bass', 'Mid', 'Treble'].map((label, b) => (
+                <button
+                  key={label}
+                  onClick={() => toggleBand(b)}
+                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
+                    bandsEnabled[b]
+                      ? 'border-white/60 text-white hover:bg-white/10'
+                      : 'border-white/20 text-white/30 hover:bg-white/5'
+                  }`}
+                >
+                  {label}: {bandsEnabled[b] ? 'on' : 'off'}
+                </button>
+              ))}
+              {generator === 'stipple' && ['particles', 'wells', 'events'].map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => toggleTraceMode(mode)}
+                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
+                    traceModes[mode]
+                      ? 'border-fuchsia-400/60 text-fuchsia-300 hover:bg-fuchsia-400/10'
+                      : 'border-white/20 text-white/30 hover:bg-white/5'
+                  }`}
+                >
+                  Trace {mode}: {traceModes[mode] ? 'on' : 'off'}
+                </button>
+              ))}
               <button
                 onClick={downloadPng}
                 className="px-6 py-3 border border-white/30 text-white/70 font-semibold hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
@@ -505,13 +623,23 @@ const ReversePage = () => {
               className="hidden"
             />
 
-            <div className="border border-white/20 bg-black aspect-square w-full">
-              <canvas
-                ref={canvasRef}
-                width={CANVAS_SIZE}
-                height={CANVAS_SIZE}
-                className="w-full h-full object-contain"
-              />
+            <div className="flex gap-4">
+              <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
+                <canvas
+                  ref={canvasRef}
+                  width={CANVAS_SIZE}
+                  height={CANVAS_SIZE}
+                  className="w-full h-full object-contain"
+                />
+              </div>
+              <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
+                <canvas
+                  ref={traceCanvasRef}
+                  width={CANVAS_SIZE}
+                  height={CANVAS_SIZE}
+                  className="w-full h-full object-contain"
+                />
+              </div>
             </div>
 
             {audioUrl && (
@@ -539,11 +667,11 @@ const ReversePage = () => {
             )}
           </div>
 
-          <div className="lg:w-1/3 flex flex-col">
+          <div className="flex flex-col">
             <h2 className="text-sm uppercase tracking-wider text-white/40 font-semibold mb-4">
               Features
             </h2>
-            <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-4">
               <FeatureSlider
                 label="Angularity"
                 value={features.angularity}

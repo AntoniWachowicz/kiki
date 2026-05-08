@@ -90,13 +90,28 @@ const REPEL_RADIUS_SQ = REPEL_RADIUS * REPEL_RADIUS;
 const REPEL_SOFTENING = 30;
 const REPEL_SOFTENING_SQ = REPEL_SOFTENING * REPEL_SOFTENING;
 
-// Noise: base amplitude + treble-driven multiplier so loud treble makes
-// the whole field shimmer. Frequencies are slow on purpose — period 8–25 s.
-const NOISE_AMP_BASE = 0.09;
-const NOISE_TREBLE_GAIN = 2.4;       // multiplier on noise at treble level=1
-const NOISE_TREBLE_ONSET_GAIN = 3.5; // extra boost during a treble onset spike
-const NOISE_FREQ_MIN = 0.0035;
-const NOISE_FREQ_MAX = 0.012;
+// Per-particle organic noise. No audio coupling — pure baseline life
+// for the field. Treble's character coupling now lives in the field-
+// tension block below.
+const NOISE_AMP_BASE = 0.04;
+const NOISE_FREQ_MIN = 0.0020;
+const NOISE_FREQ_MAX = 0.0070;
+
+// ── Treble: field tension ───────────────────────────────────────────────────
+// Treble level scales the *character* of the field — mutual repulsion
+// strength and integration damping — instead of any direct visual
+// quantity. Quiet treble leaves the field viscous and clumpable; loud
+// treble makes it springy and crisp, with particles snapping apart and
+// oscillating after impulses. Onsets give a brief extra spike on top.
+//
+// This is the abstraction we want for the "high frequency = sharpness"
+// feeling: the system's *behaviour* shifts, no on-screen "treble meter."
+const TREBLE_TENSION_LEVEL_GAIN = 1.0;   // multiplier on smoothLevels[2]
+const TREBLE_TENSION_ONSET_GAIN = 0.25;  // brief spike on a fresh treble onset
+const TREBLE_REPEL_BOOST = 0.18;         // +18% mutual repulsion at full tension
+const TREBLE_DAMPING_BOOST = 0.02;       // DAMPING shifts from 0.86 → 0.88 max
+                                         // (higher = slightly more inertia
+                                         //  preserved on impulses)
 
 // ── Bass satellites ─────────────────────────────────────────────────────────
 const BASS_SAT_COUNT = 2;
@@ -167,7 +182,11 @@ const FLOW_PULSE_FREQ_MIN = 0.0015;  // ~70 s period at 86 fps
 const FLOW_PULSE_FREQ_MAX = 0.0050;  // ~21 s period
 
 // ── Integration ─────────────────────────────────────────────────────────────
-const DAMPING = 0.78;
+// Higher = more inertia retained between frames. Bumped from 0.78 so
+// particles follow gentle arcs from the structured forces (flow, wells,
+// rotation) instead of stop-start reactions to every transient impulse.
+// This is the biggest knob for "etched motion is calligraphic vs. jittery."
+const DAMPING = 0.86;
 const EDGE_MARGIN = 14;
 const EDGE_FORCE = 0.35;
 const EDGE_BOUNCE = 0.4;
@@ -278,10 +297,55 @@ export function createStippleSession(features, seed, width, height) {
 
   const particles = new Array(N_PARTICLES);
   let rng = null;
+  // Separate RNG for the trace canvas (treble scatter etc.) so consuming
+  // random numbers in drawTraces doesn't desync the sim's main rng. Both
+  // are seeded from the same input so a given seed + audio still produces
+  // a fully deterministic replay.
+  let traceRng = null;
   let t = 0;
+  // When true, the wells (mid stripe + bass satellites) stay locked at
+  // their seeded positions. They still PULSE attract/repel from onsets
+  // (so the audio still drives the field), but they don't move — useful
+  // for inspecting the trace canvas without the wells streaking it.
+  let stationaryWells = false;
+  // Per-band enable flags. When a band is disabled, its smoothed level
+  // and onsets are forced to zero, which zeroes every audio→force
+  // coupling driven by that band: bass→satellite pull, mid→stripe pull
+  // and kiki jerk, treble→noise multiplier (base noise still runs). The
+  // visual structures themselves (satellites, stripe well, particles)
+  // stay in place; the audio just stops driving them.
+  const bandEnabled = [true, true, true];
+
+  // Which channels the trace canvas draws each frame. They compose freely:
+  //   particles — line segments from every particle's prev → current pos.
+  //               The "field record" view; rich but visually crowded.
+  //   wells     — continuous strokes following the bass satellites and the
+  //               mid stripe centre. Path of the audio-driven structures.
+  //   events    — discrete marks placed only on onset firings: filled disc
+  //               at the firing satellite (bass), cross at stripe (mid),
+  //               scattered fine dots (treble). A graphic score of hits.
+  const traceModes = { particles: true, wells: false, events: false };
+
+  // Which satellite index fired the most recent bass onset, so the events
+  // mode can mark just *that* one (kiki: one jumps far, the other stays —
+  // marking both dilutes the asymmetry).
+  let lastBassSat = -1;
+
+  // Per-frame "an onset fired this frame" flags. onset[b] is a decaying
+  // float used by force code; this is a clean boolean for the trace.
+  const onsetFired = [false, false, false];
+
+  // Previous mid stripe position, snapshotted at the end of update() so
+  // the wells trace draws (prev → current) in the next call to
+  // drawTraces. Same pattern as particles' prevX/prevY.
+  let prevMidXTrace = cxCanvas;
+  let prevMidYTrace = midY;
 
   function reset() {
     rng = mulberry32(seed);
+    // Derive a distinct stream from the same seed so trace draws are
+    // deterministic AND independent of the main rng's call count.
+    traceRng = mulberry32((seed ^ 0x9e3779b9) >>> 0);
     t = 0;
     for (let b = 0; b < 3; b++) {
       smoothLevels[b] = 0;
@@ -294,6 +358,10 @@ export function createStippleSession(features, seed, width, height) {
     smoothedPitch = 0.5;
     smoothedConf = 0;
     midJerk = 0;
+    prevMidXTrace = cxCanvas;
+    prevMidYTrace = midY;
+    lastBassSat = -1;
+    onsetFired[0] = onsetFired[1] = onsetFired[2] = false;
 
     // Bass satellites — anchored across the canvas (not tied to a band Y
     // any more, so they can roam). Distinct Lissajous freqs per satellite.
@@ -310,6 +378,9 @@ export function createStippleSession(features, seed, width, height) {
         targetY: baseY,
         x: baseX,
         y: baseY,
+        // Previous render pos for the wells trace mode.
+        prevX: baseX,
+        prevY: baseY,
         freqX: SAT_DRIFT_FREQ_X * (0.7 + rng() * 0.6),
         freqY: SAT_DRIFT_FREQ_Y * (0.7 + rng() * 0.6),
         phaseX: rng() * Math.PI * 2,
@@ -324,9 +395,16 @@ export function createStippleSession(features, seed, width, height) {
       let role = ROLE_FLOW;
       if (r >= ROLE_CUM_PROB[0]) role = (r < ROLE_CUM_PROB[1]) ? ROLE_ORBIT : ROLE_SHIMMER;
       const profile = ROLE_PROFILE[role];
+      const px = (0.05 + halton(i + offset, 2) * 0.9) * width;
+      const py = (0.05 + halton(i + offset, 3) * 0.9) * height;
       particles[i] = {
-        x: (0.05 + halton(i + offset, 2) * 0.9) * width,
-        y: (0.05 + halton(i + offset, 3) * 0.9) * height,
+        x: px,
+        y: py,
+        // Previous position for the trace canvas — line segments are drawn
+        // from (prevX, prevY) to (x, y) every frame. Initialised to current
+        // position so the first frame draws a zero-length segment.
+        prevX: px,
+        prevY: py,
         vx: 0,
         vy: 0,
         freqA: NOISE_FREQ_MIN + rng() * (NOISE_FREQ_MAX - NOISE_FREQ_MIN),
@@ -351,7 +429,16 @@ export function createStippleSession(features, seed, width, height) {
 
   function detectOnsets(rawFlux) {
     midJerk = 0;
+    onsetFired[0] = onsetFired[1] = onsetFired[2] = false;
     for (let b = 0; b < 3; b++) {
+      if (!bandEnabled[b]) {
+        // Hard-zero the band: no flux baseline tracking either, so when
+        // the band is re-enabled it adapts cleanly from quiet.
+        onset[b] = 0;
+        fluxBaseline[b] = 0;
+        onsetCooldown[b] = 0;
+        continue;
+      }
       fluxBaseline[b] += (rawFlux[b] - fluxBaseline[b]) * FLUX_BASELINE_SMOOTH;
       onset[b] *= ONSET_DECAY;
       if (onsetCooldown[b] > 0) onsetCooldown[b]--;
@@ -359,6 +446,7 @@ export function createStippleSession(features, seed, width, height) {
       if (onsetCooldown[b] === 0 && rawFlux[b] > threshold) {
         onset[b] = 1;
         onsetCooldown[b] = ONSET_REFRACTORY;
+        onsetFired[b] = true;
 
         if (b === 0) {
           // BASS: pick one satellite, compute a new target position, then
@@ -367,23 +455,28 @@ export function createStippleSession(features, seed, width, height) {
           // Sliding from `targetX,Y` (not `baseX,Y`) so successive shifts
           // chain — a flurry of onsets sends the satellite further each
           // time instead of bouncing around the previous anchor.
+          // In stationaryWells mode we still flip to repel (so onsets
+          // still register on the field) but skip the relocation.
           const sIdx = Math.floor(rng() * satellites.length);
           const sat = satellites[sIdx];
-          const stepFrac = SAT_STEP_BASE + angularity * SAT_STEP_PER_ANGULARITY;
-          const ang = rng() * Math.PI * 2;
-          const step = (0.4 + rng() * 0.6) * minDim * stepFrac;
-          let nx = sat.targetX + Math.cos(ang) * step;
-          let ny = sat.targetY + Math.sin(ang) * step;
-          if (nx < width * 0.15) nx = width * 0.15;
-          else if (nx > width * 0.85) nx = width * 0.85;
-          if (ny < height * 0.15) ny = height * 0.15;
-          else if (ny > height * 0.85) ny = height * 0.85;
-          sat.targetX = nx;
-          sat.targetY = ny;
-          if (rng() < teleportProb) {
-            // Instant — the "disappear and reappear" beat.
-            sat.baseX = nx;
-            sat.baseY = ny;
+          lastBassSat = sIdx;
+          if (!stationaryWells) {
+            const stepFrac = SAT_STEP_BASE + angularity * SAT_STEP_PER_ANGULARITY;
+            const ang = rng() * Math.PI * 2;
+            const step = (0.4 + rng() * 0.6) * minDim * stepFrac;
+            let nx = sat.targetX + Math.cos(ang) * step;
+            let ny = sat.targetY + Math.sin(ang) * step;
+            if (nx < width * 0.15) nx = width * 0.15;
+            else if (nx > width * 0.85) nx = width * 0.85;
+            if (ny < height * 0.15) ny = height * 0.15;
+            else if (ny > height * 0.85) ny = height * 0.85;
+            sat.targetX = nx;
+            sat.targetY = ny;
+            if (rng() < teleportProb) {
+              // Instant — the "disappear and reappear" beat.
+              sat.baseX = nx;
+              sat.baseY = ny;
+            }
           }
           // Flip to repel only on teleporting kicks; smooth-slide onsets
           // don't get the explosive push, which calms kiki considerably.
@@ -402,24 +495,45 @@ export function createStippleSession(features, seed, width, height) {
 
   function update(rawLevels, rawFlux, rawCentroid, rawPitch) {
     t++;
+    // Snapshot well positions BEFORE any updates this frame, so the
+    // wells trace can draw (prev → current) segments after we recompute.
+    prevMidXTrace = midX;
+    prevMidYTrace = midYNow;
+    for (let s = 0; s < satellites.length; s++) {
+      satellites[s].prevX = satellites[s].x;
+      satellites[s].prevY = satellites[s].y;
+    }
     for (let b = 0; b < 3; b++) {
-      smoothLevels[b] += (rawLevels[b] - smoothLevels[b]) * LEVEL_SMOOTH;
+      // Disabled bands feed zero into the smoother, so smoothLevels[b]
+      // ramps down to zero over a few frames after toggle-off rather
+      // than snapping (matches the visual feel of the band fading out).
+      const lvl = bandEnabled[b] ? rawLevels[b] : 0;
+      smoothLevels[b] += (lvl - smoothLevels[b]) * LEVEL_SMOOTH;
     }
     // Mid horizontal target tracks the mid centroid, gated by mid level
-    // (silent mid → centred target, no jitter).
-    const midAudible = Math.min(1, Math.max(0, (smoothLevels[1] - MIDX_AUDIBLE_THRESH) * 6));
-    const midC = rawCentroid ? rawCentroid[1] : 0.5;
-    const midTarget = cxCanvas + (midC - 0.5) * 2 * midXSpan * midAudible;
-    midX += (midTarget - midX) * MIDX_SMOOTH;
+    // (silent mid → centred target, no jitter). Skipped in stationary
+    // mode so the stripe well stays locked at canvas centre.
+    if (!stationaryWells) {
+      const midAudible = Math.min(1, Math.max(0, (smoothLevels[1] - MIDX_AUDIBLE_THRESH) * 6));
+      const midC = rawCentroid ? rawCentroid[1] : 0.5;
+      const midTarget = cxCanvas + (midC - 0.5) * 2 * midXSpan * midAudible;
+      midX += (midTarget - midX) * MIDX_SMOOTH;
+    }
 
     detectOnsets(rawFlux);
 
-    // Effective per-band strengths. Only s1 (mid) and s0 (bass) drive
-    // forces; s2 (treble) drives the noise multiplier below.
+    // Effective per-band strengths. s0 (bass) and s1 (mid) drive force
+    // magnitudes directly; s2 (treble) is folded into the field-tension
+    // factor below — it tunes the *character* of the simulation rather
+    // than adding any direct force or visible quantity.
     const s0 = smoothLevels[0] + onset[0] * ONSET_BOOST;
     const s1 = smoothLevels[1] + onset[1] * ONSET_BOOST;
-    const trebleNoiseMul =
-      1 + smoothLevels[2] * NOISE_TREBLE_GAIN + onset[2] * NOISE_TREBLE_ONSET_GAIN;
+    const trebleTension = Math.min(
+      1,
+      smoothLevels[2] * TREBLE_TENSION_LEVEL_GAIN + onset[2] * TREBLE_TENSION_ONSET_GAIN,
+    );
+    const effectiveDamping = DAMPING + trebleTension * TREBLE_DAMPING_BOOST;
+    const effectiveRepelGain = REPEL_GAIN * (1 + trebleTension * TREBLE_REPEL_BOOST);
 
     // Curl flow field: per-frame gain (audio-modulated) and time argument.
     // Declared up here because the satellite block below uses them too.
@@ -442,62 +556,74 @@ export function createStippleSession(features, seed, width, height) {
     const xMax = width * 0.90;
     const yMin = height * 0.10;
     const yMax = height * 0.90;
-    // (a) Mutual repulsion between satellite anchors.
-    for (let i = 0; i < satellites.length; i++) {
-      const a = satellites[i];
-      for (let j = 0; j < satellites.length; j++) {
-        if (i === j) continue;
-        const b = satellites[j];
-        const ddx = a.baseX - b.baseX;
-        const ddy = a.baseY - b.baseY;
-        const dist2soft = ddx * ddx + ddy * ddy + SAT_MUTUAL_REPEL_SOFTENING_SQ;
-        const distSoft = Math.sqrt(dist2soft);
-        const f = SAT_MUTUAL_REPEL_GAIN / dist2soft;
-        const px = (ddx / distSoft) * f;
-        const py = (ddy / distSoft) * f;
-        a.baseX += px;
-        a.baseY += py;
-        a.targetX += px;
-        a.targetY += py;
+    if (!stationaryWells) {
+      // (a) Mutual repulsion between satellite anchors.
+      for (let i = 0; i < satellites.length; i++) {
+        const a = satellites[i];
+        for (let j = 0; j < satellites.length; j++) {
+          if (i === j) continue;
+          const b = satellites[j];
+          const ddx = a.baseX - b.baseX;
+          const ddy = a.baseY - b.baseY;
+          const dist2soft = ddx * ddx + ddy * ddy + SAT_MUTUAL_REPEL_SOFTENING_SQ;
+          const distSoft = Math.sqrt(dist2soft);
+          const f = SAT_MUTUAL_REPEL_GAIN / dist2soft;
+          const px = (ddx / distSoft) * f;
+          const py = (ddy / distSoft) * f;
+          a.baseX += px;
+          a.baseY += py;
+          a.targetX += px;
+          a.targetY += py;
+        }
       }
     }
     // (b) Curl-flow drift + (c) onset-driven slide + Lissajous around
     // the resulting anchor; cache signed strength for the particle loop.
+    // In stationary mode we skip all the position math (sat stays at its
+    // seed baseX/Y) but still update the signedStrength so onsets pulse.
     for (let s = 0; s < satellites.length; s++) {
       const sat = satellites[s];
-      const fxArg = sat.baseX * FLOW_K + flowTime;
-      const fyArg = sat.baseY * FLOW_K - flowTimeY;
-      const flowVx = -Math.sin(fxArg) * Math.sin(fyArg) * flowGain * SAT_FLOW_GAIN;
-      const flowVy = -Math.cos(fxArg) * Math.cos(fyArg) * flowGain * SAT_FLOW_GAIN;
-      sat.baseX += flowVx;
-      sat.baseY += flowVy;
-      sat.targetX += flowVx;
-      sat.targetY += flowVy;
-      // Clamp to a 10–90 % margin so flow + repel can't park them on the
-      // canvas edge where their gravity well would be half-cut.
-      if (sat.baseX < xMin) sat.baseX = xMin; else if (sat.baseX > xMax) sat.baseX = xMax;
-      if (sat.baseY < yMin) sat.baseY = yMin; else if (sat.baseY > yMax) sat.baseY = yMax;
-      if (sat.targetX < xMin) sat.targetX = xMin; else if (sat.targetX > xMax) sat.targetX = xMax;
-      if (sat.targetY < yMin) sat.targetY = yMin; else if (sat.targetY > yMax) sat.targetY = yMax;
-      // Slide toward target then apply Lissajous drift on top.
-      sat.baseX += (sat.targetX - sat.baseX) * satSlideRate;
-      sat.baseY += (sat.targetY - sat.baseY) * satSlideRate;
-      sat.x = sat.baseX + Math.sin(t * sat.freqX + sat.phaseX) * satDriftAmp;
-      sat.y = sat.baseY + Math.cos(t * sat.freqY + sat.phaseY) * satDriftAmp;
+      if (!stationaryWells) {
+        const fxArg = sat.baseX * FLOW_K + flowTime;
+        const fyArg = sat.baseY * FLOW_K - flowTimeY;
+        const flowVx = -Math.sin(fxArg) * Math.sin(fyArg) * flowGain * SAT_FLOW_GAIN;
+        const flowVy = -Math.cos(fxArg) * Math.cos(fyArg) * flowGain * SAT_FLOW_GAIN;
+        sat.baseX += flowVx;
+        sat.baseY += flowVy;
+        sat.targetX += flowVx;
+        sat.targetY += flowVy;
+        // Clamp to a 10–90 % margin so flow + repel can't park them on the
+        // canvas edge where their gravity well would be half-cut.
+        if (sat.baseX < xMin) sat.baseX = xMin; else if (sat.baseX > xMax) sat.baseX = xMax;
+        if (sat.baseY < yMin) sat.baseY = yMin; else if (sat.baseY > yMax) sat.baseY = yMax;
+        if (sat.targetX < xMin) sat.targetX = xMin; else if (sat.targetX > xMax) sat.targetX = xMax;
+        if (sat.targetY < yMin) sat.targetY = yMin; else if (sat.targetY > yMax) sat.targetY = yMax;
+        // Slide toward target then apply Lissajous drift on top.
+        sat.baseX += (sat.targetX - sat.baseX) * satSlideRate;
+        sat.baseY += (sat.targetY - sat.baseY) * satSlideRate;
+        sat.x = sat.baseX + Math.sin(t * sat.freqX + sat.phaseX) * satDriftAmp;
+        sat.y = sat.baseY + Math.cos(t * sat.freqY + sat.phaseY) * satDriftAmp;
+      } else {
+        sat.x = sat.baseX;
+        sat.y = sat.baseY;
+      }
       if (sat.repelFrames > 0) sat.repelFrames--;
       const sign = sat.repelFrames > 0 ? -SAT_REPEL_GAIN : 1;
       sat.signedStrength = sign * s0;
     }
     // (c) Mid stripe Y target — blend of pitch contour (when melody is
-    //     detected) and slow curl-flow bob (when it isn't).
-    {
+    //     detected) and slow curl-flow bob (when it isn't). Locked at
+    //     canvas centre when stationaryWells is on.
+    if (!stationaryWells) {
       const mxArg = midX * FLOW_K + flowTime;
       const myArg = midY * FLOW_K - flowTimeY;
       const midFlowDy = -Math.cos(mxArg) * Math.cos(myArg);
       const flowOffset = midFlowDy * MID_FLOW_AMP;
 
-      const targetPitch = rawPitch ? rawPitch[0] : 0.5;
-      const targetConf = rawPitch ? rawPitch[1] : 0;
+      // Pitch is conceptually a mid-band feature — when mid is disabled,
+      // the stripe shouldn't track it either.
+      const targetPitch = (rawPitch && bandEnabled[1]) ? rawPitch[0] : 0.5;
+      const targetConf = (rawPitch && bandEnabled[1]) ? rawPitch[1] : 0;
       smoothedConf += (targetConf - smoothedConf) * PITCH_CONF_SMOOTH;
 
       // Big confident pitch jumps snap; everything else smooths. The
@@ -513,6 +639,8 @@ export function createStippleSession(features, seed, width, height) {
       // pitch=0 (low) → stripe drops below centre; pitch=1 (high) → above.
       const pitchOffset = (0.5 - smoothedPitch) * 2 * PITCH_RANGE_FRAC * height;
       midYNow = midY + flowOffset * (1 - smoothedConf) + pitchOffset * smoothedConf;
+    } else {
+      midYNow = midY;
     }
 
     rebuildGrid(grid, particles);
@@ -520,6 +648,10 @@ export function createStippleSession(features, seed, width, height) {
 
     for (let i = 0; i < N_PARTICLES; i++) {
       const p = particles[i];
+      // Snapshot before integration — the trace canvas draws segments from
+      // (prevX, prevY) → (x, y) using these.
+      p.prevX = p.x;
+      p.prevY = p.y;
       let fx = 0;
       let fy = 0;
 
@@ -557,7 +689,7 @@ export function createStippleSession(features, seed, width, height) {
             const dist2 = ddx * ddx + ddy * ddy;
             if (dist2 >= REPEL_RADIUS_SQ || dist2 < 0.0001) continue;
             const cutoff = 1 - dist2 / REPEL_RADIUS_SQ;
-            const k_ = REPEL_GAIN * cutoff / (dist2 + REPEL_SOFTENING_SQ);
+            const k_ = effectiveRepelGain * cutoff / (dist2 + REPEL_SOFTENING_SQ);
             fx += ddx * k_;
             fy += ddy * k_;
           }
@@ -622,11 +754,12 @@ export function createStippleSession(features, seed, width, height) {
         fx += midJerk * KIKI_JERK_MAG * kikiAmt * p.midW;
       }
 
-      // ── 7. Per-particle deterministic noise (treble-modulated) ─────────
+      // ── 7. Per-particle deterministic noise ────────────────────────────
       // p.noiseW is the per-role amplifier — shimmer particles get 3×
-      // the noise of flow, orbit gets 0.7× (so they cluster more cleanly
-      // around their satellite). Treble multiplier applies on top.
-      const noiseAmp = NOISE_AMP_BASE * trebleNoiseMul * p.noiseW;
+      // the noise of flow, orbit gets 0.7×. Audio coupling for treble is
+      // not here any more; it lives in the field-tension factor that
+      // shapes damping and repulsion.
+      const noiseAmp = NOISE_AMP_BASE * p.noiseW;
       const tA = t * p.freqA * noiseSpeedScale;
       const tB = t * p.freqB * noiseSpeedScale;
       fx += Math.sin(tA + p.phaseA) * noiseAmp;
@@ -638,8 +771,8 @@ export function createStippleSession(features, seed, width, height) {
       if (p.y < EDGE_MARGIN) fy += (EDGE_MARGIN - p.y) * EDGE_FORCE;
       else if (p.y > height - EDGE_MARGIN) fy -= (p.y - (height - EDGE_MARGIN)) * EDGE_FORCE;
 
-      p.vx = (p.vx + fx) * DAMPING;
-      p.vy = (p.vy + fy) * DAMPING;
+      p.vx = (p.vx + fx) * effectiveDamping;
+      p.vy = (p.vy + fy) * effectiveDamping;
       p.x += p.vx;
       p.y += p.vy;
 
@@ -772,7 +905,115 @@ export function createStippleSession(features, seed, width, height) {
   function setDebug(on) {
     debug = !!on;
   }
+
+  function setStationaryWells(on) {
+    stationaryWells = !!on;
+  }
+
+  // band: 0 = bass, 1 = mid, 2 = treble. Out-of-range silently ignored.
+  function setBandEnabled(band, on) {
+    if (band < 0 || band > 2) return;
+    bandEnabled[band] = !!on;
+  }
   // ── END DEBUG ─────────────────────────────────────────────────────────────
+
+  // Draws one frame's worth of line segments — (prevX, prevY) → (x, y) for
+  // each particle — onto an external context that is NOT cleared between
+  // frames. Over the course of playback the segments accumulate into a
+  // composite "result image" of the motion. Called by the page after every
+  // session.update(); the page is responsible for clearing the trace canvas
+  // on reset (new file, generator switch, backward seek).
+  function drawTraces(ctx) {
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // ── 1. Particles: every particle's segment, faint, accumulates ─────
+    if (traceModes.particles) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (let i = 0; i < N_PARTICLES; i++) {
+        const p = particles[i];
+        ctx.moveTo(p.prevX, p.prevY);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+
+    // ── 2. Wells: continuous strokes following the audio-driven structures ─
+    // Bass satellites draw lines from prev → current pos (so the trace
+    // shows their roaming/jumping pattern); mid stripe centre likewise.
+    // Alpha is gated by the band's activity so silence doesn't draw
+    // "well sitting still" lines.
+    if (traceModes.wells) {
+      const bassActivity = smoothLevels[0] + onset[0] * 0.7;
+      if (bandEnabled[0] && bassActivity > 0.04) {
+        ctx.strokeStyle = `rgba(255,255,255,${Math.min(0.6, bassActivity * 0.9).toFixed(3)})`;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        for (let s = 0; s < satellites.length; s++) {
+          const sat = satellites[s];
+          ctx.moveTo(sat.prevX, sat.prevY);
+          ctx.lineTo(sat.x, sat.y);
+        }
+        ctx.stroke();
+      }
+      const midActivity = smoothLevels[1] + onset[1] * 0.7;
+      if (bandEnabled[1] && midActivity > 0.04) {
+        ctx.strokeStyle = `rgba(255,255,255,${Math.min(0.7, midActivity * 1.1).toFixed(3)})`;
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(prevMidXTrace, prevMidYTrace);
+        ctx.lineTo(midX, midYNow);
+        ctx.stroke();
+      }
+    }
+
+    // ── 3. Events: discrete marks on onset firings ─────────────────────
+    // bass:   filled disc at the *firing* satellite, sized by bass level.
+    //         Marks the actual hit, not the surrounding drift.
+    // mid:    short cross at (midX, midYNow). Reads as a punctuation mark
+    //         on the stripe; rotated 45° at high angularity to look "kiki."
+    // treble: 4–7 fine dots scattered across the canvas. No spatial logic
+    //         (treble has no position in this system) — just sparkle.
+    if (traceModes.events) {
+      if (onsetFired[0] && lastBassSat >= 0 && bandEnabled[0]) {
+        const sat = satellites[lastBassSat];
+        const r = 4 + smoothLevels[0] * 18 + onset[0] * 6;
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.beginPath();
+        ctx.arc(sat.x, sat.y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (onsetFired[1] && bandEnabled[1]) {
+        const arm = 6 + smoothLevels[1] * 10;
+        const rot = angularity > 0.5 ? Math.PI / 4 : 0;
+        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        const c = Math.cos(rot), s = Math.sin(rot);
+        ctx.moveTo(midX - arm * c, midYNow - arm * s);
+        ctx.lineTo(midX + arm * c, midYNow + arm * s);
+        ctx.moveTo(midX + arm * s, midYNow - arm * c);
+        ctx.lineTo(midX - arm * s, midYNow + arm * c);
+        ctx.stroke();
+      }
+      if (onsetFired[2] && bandEnabled[2]) {
+        const n = 4 + Math.floor(traceRng() * 4);
+        ctx.fillStyle = 'rgba(255,255,255,0.45)';
+        for (let k = 0; k < n; k++) {
+          const px = traceRng() * width;
+          const py = traceRng() * height;
+          const sz = 1 + traceRng() * 1.5;
+          ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+        }
+      }
+    }
+  }
+
+  function setTraceMode(mode, on) {
+    if (mode in traceModes) traceModes[mode] = !!on;
+  }
 
   function draw(ctx) {
     ctx.fillStyle = '#000';
@@ -791,5 +1032,5 @@ export function createStippleSession(features, seed, width, height) {
     if (debug) drawDebugOverlay(ctx);
   }
 
-  return { update, draw, reset, setDebug };
+  return { update, draw, drawTraces, reset, setDebug, setStationaryWells, setBandEnabled, setTraceMode };
 }
