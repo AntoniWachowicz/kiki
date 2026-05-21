@@ -93,7 +93,7 @@ const REPEL_SOFTENING_SQ = REPEL_SOFTENING * REPEL_SOFTENING;
 // Per-particle organic noise. No audio coupling — pure baseline life
 // for the field. Treble's character coupling now lives in the field-
 // tension block below.
-const NOISE_AMP_BASE = 0.04;
+const NOISE_AMP_BASE = 0.008;
 const NOISE_FREQ_MIN = 0.0020;
 const NOISE_FREQ_MAX = 0.0070;
 
@@ -149,7 +149,7 @@ const SAT_STEP_BASE = 0.06;          // step as fraction of minDim
 const SAT_STEP_PER_ANGULARITY = 0.45;
 
 // ── Bouba rotation / Kiki jerk ──────────────────────────────────────────────
-const BOUBA_ROT_GAIN = 0.18;
+const BOUBA_ROT_GAIN = 0.03;
 const KIKI_JERK_MAG = 2.5;           // was 4 — kiki was too punchy
 
 // ── Curl flow field ─────────────────────────────────────────────────────────
@@ -167,8 +167,8 @@ const KIKI_JERK_MAG = 2.5;           // was 4 — kiki was too punchy
 //   scaled by mean band level, so loud passages strengthen the currents.
 const FLOW_K = 0.008;
 const FLOW_T = 0.0015;
-const FLOW_AMP_BASE = 0.30;
-const FLOW_AMP_AUDIO = 0.45;
+const FLOW_AMP_BASE = 0.02;
+const FLOW_AMP_AUDIO = 0.80;
 
 // Per-particle slow gating. Each particle has its own pulse cycle
 // (period 21–70 s) and phase, so at any moment only a *subset* of the
@@ -186,7 +186,7 @@ const FLOW_PULSE_FREQ_MAX = 0.0050;  // ~21 s period
 // particles follow gentle arcs from the structured forces (flow, wells,
 // rotation) instead of stop-start reactions to every transient impulse.
 // This is the biggest knob for "etched motion is calligraphic vs. jittery."
-const DAMPING = 0.86;
+const DAMPING = 0.82;
 const EDGE_MARGIN = 14;
 const EDGE_FORCE = 0.35;
 const EDGE_BOUNCE = 0.4;
@@ -424,6 +424,16 @@ export function createStippleSession(features, seed, width, height) {
       };
     }
   }
+
+  // Extend physics bounds 4 % beyond each canvas edge so the edge-spring
+  // accumulation line and the dark halo it creates are off-screen.
+  // Particles can wander into the overshoot zone; the canvas clips them when
+  // drawing so nothing appears outside the visible area.
+  const overshoot = Math.round(Math.min(width, height) * 0.04);
+  const physX0 = -overshoot;
+  const physX1 =  width  + overshoot;
+  const physY0 = -overshoot;
+  const physY1 =  height + overshoot;
 
   reset();
 
@@ -766,20 +776,22 @@ export function createStippleSession(features, seed, width, height) {
       fy += Math.cos(tB + p.phaseB) * noiseAmp;
 
       // ── 8. Soft edge spring + hard bounce backup ───────────────────────
-      if (p.x < EDGE_MARGIN) fx += (EDGE_MARGIN - p.x) * EDGE_FORCE;
-      else if (p.x > width - EDGE_MARGIN) fx -= (p.x - (width - EDGE_MARGIN)) * EDGE_FORCE;
-      if (p.y < EDGE_MARGIN) fy += (EDGE_MARGIN - p.y) * EDGE_FORCE;
-      else if (p.y > height - EDGE_MARGIN) fy -= (p.y - (height - EDGE_MARGIN)) * EDGE_FORCE;
+      // Both operate on the extended physics bounds (physX0/1, physY0/1)
+      // so the spring accumulation line sits ~4 % off-canvas.
+      if (p.x < physX0 + EDGE_MARGIN) fx += (physX0 + EDGE_MARGIN - p.x) * EDGE_FORCE;
+      else if (p.x > physX1 - EDGE_MARGIN) fx -= (p.x - (physX1 - EDGE_MARGIN)) * EDGE_FORCE;
+      if (p.y < physY0 + EDGE_MARGIN) fy += (physY0 + EDGE_MARGIN - p.y) * EDGE_FORCE;
+      else if (p.y > physY1 - EDGE_MARGIN) fy -= (p.y - (physY1 - EDGE_MARGIN)) * EDGE_FORCE;
 
       p.vx = (p.vx + fx) * effectiveDamping;
       p.vy = (p.vy + fy) * effectiveDamping;
       p.x += p.vx;
       p.y += p.vy;
 
-      if (p.x < 0) { p.x = 0; p.vx = Math.abs(p.vx) * EDGE_BOUNCE; }
-      else if (p.x > width - 1) { p.x = width - 1; p.vx = -Math.abs(p.vx) * EDGE_BOUNCE; }
-      if (p.y < 0) { p.y = 0; p.vy = Math.abs(p.vy) * EDGE_BOUNCE; }
-      else if (p.y > height - 1) { p.y = height - 1; p.vy = -Math.abs(p.vy) * EDGE_BOUNCE; }
+      if (p.x < physX0) { p.x = physX0; p.vx =  Math.abs(p.vx) * EDGE_BOUNCE; }
+      else if (p.x > physX1) { p.x = physX1; p.vx = -Math.abs(p.vx) * EDGE_BOUNCE; }
+      if (p.y < physY0) { p.y = physY0; p.vy =  Math.abs(p.vy) * EDGE_BOUNCE; }
+      else if (p.y > physY1) { p.y = physY1; p.vy = -Math.abs(p.vy) * EDGE_BOUNCE; }
     }
   }
 

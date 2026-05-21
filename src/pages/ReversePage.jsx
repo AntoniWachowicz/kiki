@@ -1,9 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Upload, Download, AlertCircle, Play } from 'lucide-react';
+import { Upload, Download, AlertCircle, Play, Mic, MicOff } from 'lucide-react';
 import { analyzeAudioFile } from '../audioAnalysis';
-import { deriveStaticState, deriveFrameState, draw, hashString } from '../voronoiGenerator';
 import { createStippleSession } from '../stippleGenerator';
+
+function hashString(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 const CANVAS_SIZE = 1024;
 
@@ -24,7 +32,6 @@ const ReversePage = () => {
   const [error, setError] = useState(null);
   const [sourceLabel, setSourceLabel] = useState('manual');
   const [audioUrl, setAudioUrl] = useState(null);
-  const [generator, setGenerator] = useState('voronoi');
   const [urlInput, setUrlInput] = useState('');
   // DEBUG: temp overlay showing band levels / onsets / centroid crosses on
   // top of the particle field. Remove this state + the toggle button + the
@@ -51,7 +58,7 @@ const ReversePage = () => {
   const canvasRef = useRef(null);
   // Companion canvas. Accumulates line segments from each particle's
   // previous → current position every frame, never clearing between
-  // frames. Cleared only on reset (new file, generator switch, backward
+  // frames. Cleared only on reset (new file / backward
   // seek). The animation canvas shows live motion; this one shows the
   // composite "result image" the motion produces.
   const traceCanvasRef = useRef(null);
@@ -67,9 +74,22 @@ const ReversePage = () => {
   // its initial reset state, no frames stepped yet."
   const lastFrameIdxRef = useRef(-1);
 
+  const [showDevTools, setShowDevTools] = useState(false);
+
+  // Live mic state
+  const [micActive, setMicActive] = useState(false);
+  const micStreamRef = useRef(null);
+  const micContextRef = useRef(null);
+  const micAnalyserRef = useRef(null);
+  const micRafRef = useRef(null);
+  const prevSpectrumRef = useRef(null);
+
   useEffect(() => {
     return () => {
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      if (micRafRef.current) cancelAnimationFrame(micRafRef.current);
+      if (micStreamRef.current) micStreamRef.current.getTracks().forEach(t => t.stop());
+      if (micContextRef.current) micContextRef.current.close();
     };
   }, []);
 
@@ -83,31 +103,127 @@ const ReversePage = () => {
     tctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
   };
 
-  // Voronoi: render on feature/seed change. Fast and stateless.
-  // Stipple: (re)build a session and show its final trace as the default image.
+  const stopMic = () => {
+    if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+    if (micStreamRef.current) { micStreamRef.current.getTracks().forEach(t => t.stop()); micStreamRef.current = null; }
+    if (micContextRef.current) { micContextRef.current.close(); micContextRef.current = null; }
+    micAnalyserRef.current = null;
+    prevSpectrumRef.current = null;
+    setMicActive(false);
+  };
+
+  const startMic = async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0;
+      source.connect(analyser);
+      micStreamRef.current = stream;
+      micContextRef.current = audioCtx;
+      micAnalyserRef.current = analyser;
+      prevSpectrumRef.current = new Uint8Array(analyser.frequencyBinCount);
+      if (audioRef.current && !audioRef.current.paused) audioRef.current.pause();
+      setMicActive(true);
+    } catch (err) {
+      setError('Microphone access denied: ' + (err.message || String(err)));
+    }
+  };
+
+  // Live mic rAF loop — runs while micActive, reads from the live AnalyserNode
+  // and drives the stipple session in real time. Trace canvas accumulates
+  // indefinitely (cleared only on session reset via feature/seed change).
+  useEffect(() => {
+    if (!micActive) return;
+    const analyser = micAnalyserRef.current;
+    const canvas = canvasRef.current;
+    const traceCanvas = traceCanvasRef.current;
+    if (!analyser || !canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const traceCtx = traceCanvas ? traceCanvas.getContext('2d') : null;
+    const binCount = analyser.frequencyBinCount; // 1024
+    const spectrum = new Uint8Array(binCount);
+
+    const sampleRate = micContextRef.current.sampleRate;
+    const binHz = sampleRate / analyser.fftSize;
+    const bassEnd = Math.min(binCount - 1, Math.round(1500 / binHz));
+    const midEnd  = Math.min(binCount - 1, Math.round(6000 / binHz));
+    const pitchLo = Math.max(0, Math.round(80   / binHz));
+    const pitchHi = Math.min(binCount - 1, Math.round(1300 / binHz));
+
+    const levelBuf    = [0, 0, 0];
+    const fluxBuf     = [0, 0, 0];
+    const centroidBuf = [0.5, 0.5, 0.5];
+    const pitchBuf    = [0.5, 0];
+
+    const computeBand = (start, end, idx) => {
+      const prev = prevSpectrumRef.current;
+      let energy = 0, flux = 0, centNum = 0, centDen = 0;
+      const count = end - start;
+      if (count <= 0) return;
+      for (let i = start; i < end; i++) {
+        const v = spectrum[i] / 255;
+        const p = prev[i] / 255;
+        energy  += v * v;
+        flux    += Math.max(0, v - p);
+        centNum += v * (i - start);
+        centDen += v;
+      }
+      levelBuf[idx]    = Math.sqrt(energy / count);
+      fluxBuf[idx]     = flux / count;
+      centroidBuf[idx] = centDen > 0 ? centNum / centDen / count : 0.5;
+    };
+
+    const computePitch = () => {
+      let bestVal = -1, bestBin = pitchLo;
+      for (let bin = pitchLo; bin <= pitchHi; bin++) {
+        const v = (spectrum[bin] / 255) *
+                  (spectrum[Math.min(bin * 2, binCount - 1)] / 255) *
+                  (spectrum[Math.min(bin * 3, binCount - 1)] / 255);
+        if (v > bestVal) { bestVal = v; bestBin = bin; }
+      }
+      const hz = bestBin * binHz;
+      pitchBuf[0] = Math.max(0, Math.min(1, Math.log(hz / 80) / Math.log(1300 / 80)));
+      let mean = 0;
+      for (let i = pitchLo; i <= pitchHi; i++) mean += spectrum[i] / 255;
+      mean /= Math.max(1, pitchHi - pitchLo + 1);
+      pitchBuf[1] = mean > 0.05 ? Math.min(1, bestVal / (mean * mean * mean + 0.001) * 0.1) : 0;
+    };
+
+    const loop = () => {
+      const session = stippleSessionRef.current;
+      if (session) {
+        analyser.getByteFrequencyData(spectrum);
+        computeBand(0, bassEnd, 0);
+        computeBand(bassEnd, midEnd, 1);
+        computeBand(midEnd, binCount, 2);
+        computePitch();
+        prevSpectrumRef.current.set(spectrum);
+        session.update(levelBuf, fluxBuf, centroidBuf, pitchBuf);
+        if (traceCtx && session.drawTraces) session.drawTraces(traceCtx);
+        session.draw(ctx);
+      }
+      micRafRef.current = requestAnimationFrame(loop);
+    };
+
+    micRafRef.current = requestAnimationFrame(loop);
+    return () => { if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; } };
+  }, [micActive]);
+
+  // (Re)build a stipple session on feature/seed change and show the initial state.
   // Playback then drives sim progress from audio.currentTime (see effect below).
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
 
-    if (generator === 'voronoi') {
-      stippleSessionRef.current = null;
-      clearTraceCanvas();
-      try {
-        const staticState = deriveStaticState(features, seed, CANVAS_SIZE, CANVAS_SIZE);
-        const frameState = deriveFrameState(staticState, 0);
-        draw(ctx, frameState);
-      } catch (err) {
-        console.error('Render failed:', err);
-      }
-      return;
-    }
-
     try {
       const session = createStippleSession(features, seed, CANVAS_SIZE, CANVAS_SIZE);
       stippleSessionRef.current = session;
-      // DEBUG: re-apply the toggle on a freshly-created session.
       if (session.setDebug) session.setDebug(showDebug);
       if (session.setStationaryWells) session.setStationaryWells(stationaryWells);
       if (session.setBandEnabled) {
@@ -118,52 +234,47 @@ const ReversePage = () => {
           session.setTraceMode(m, traceModes[m]);
         }
       }
-      // Fresh session is at its reset state — no frames applied yet.
       lastFrameIdxRef.current = -1;
       clearTraceCanvas();
       session.draw(ctx);
     } catch (err) {
       console.error('Stipple session failed:', err);
     }
-  }, [features, seed, generator]);
+  }, [features, seed]);
 
   // DEBUG: when the toggle changes, reflect it on the current session and
   // force a redraw so it's visible even while audio is paused.
   useEffect(() => {
-    if (generator !== 'stipple') return;
     const session = stippleSessionRef.current;
     const canvas = canvasRef.current;
     if (!session || !canvas || !session.setDebug) return;
     session.setDebug(showDebug);
     session.draw(canvas.getContext('2d'));
-  }, [showDebug, generator]);
+  }, [showDebug]);
 
   // When the stationary-wells toggle flips, push it to the session.
   // No reset/redraw — the change takes effect from the next sim frame.
   useEffect(() => {
-    if (generator !== 'stipple') return;
     const session = stippleSessionRef.current;
     if (!session || !session.setStationaryWells) return;
     session.setStationaryWells(stationaryWells);
-  }, [stationaryWells, generator]);
+  }, [stationaryWells]);
 
   // Push per-band enable flags to the session whenever they toggle.
   useEffect(() => {
-    if (generator !== 'stipple') return;
     const session = stippleSessionRef.current;
     if (!session || !session.setBandEnabled) return;
     for (let b = 0; b < 3; b++) session.setBandEnabled(b, bandsEnabled[b]);
-  }, [bandsEnabled, generator]);
+  }, [bandsEnabled]);
 
   // Push trace-mode flags whenever they toggle.
   useEffect(() => {
-    if (generator !== 'stipple') return;
     const session = stippleSessionRef.current;
     if (!session || !session.setTraceMode) return;
     for (const m of ['particles', 'wells', 'events']) {
       session.setTraceMode(m, traceModes[m]);
     }
-  }, [traceModes, generator]);
+  }, [traceModes]);
 
   // Drive the stipple simulation from a pre-computed bands timeline so playback
   // is fully deterministic w.r.t. audio.currentTime. Seeking backward resets
@@ -171,7 +282,6 @@ const ReversePage = () => {
   // through the bands it skipped over. End-of-track replay works for free —
   // a fresh play starts at currentTime ≈ 0, which triggers a reset.
   useEffect(() => {
-    if (generator !== 'stipple') return;
     const audio = audioRef.current;
     const canvas = canvasRef.current;
     if (!audio || !canvas) return;
@@ -290,7 +400,7 @@ const ReversePage = () => {
     audio.addEventListener('seeked', onSeeked);
 
     // Initial sync for the case where this effect mounts after the user is
-    // already partway through (e.g. switching generators mid-playback).
+    // already partway through (e.g. audio loaded before effect mounts).
     syncTo(targetFrame());
     if (!audio.paused && !audio.ended) {
       rafRef.current = requestAnimationFrame(loop);
@@ -306,7 +416,7 @@ const ReversePage = () => {
       audio.removeEventListener('ended', onStop);
       audio.removeEventListener('seeked', onSeeked);
     };
-  }, [generator, audioUrl]);
+  }, [audioUrl]);
 
   const setAudioBlob = (blob) => {
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
@@ -431,7 +541,7 @@ const ReversePage = () => {
   };
 
   const downloadPng = () => {
-    const canvas = canvasRef.current;
+    const canvas = traceCanvasRef.current;
     if (!canvas) return;
     canvas.toBlob((blob) => {
       if (!blob) return;
@@ -454,11 +564,7 @@ const ReversePage = () => {
         <div className="flex justify-between items-start mb-8">
           <div>
             <h1 className="text-4xl lg:text-5xl font-bold text-white mb-2">Sound → Image</h1>
-            <p className="text-white/50">
-              {generator === 'voronoi'
-                ? 'Voronoi generator driven by audio features'
-                : 'Particles pulled by live bass / mid / treble energy'}
-            </p>
+            <p className="text-white/50">Particles pulled by live bass / mid / treble energy</p>
           </div>
           <Link
             to="/"
@@ -477,30 +583,8 @@ const ReversePage = () => {
 
         <div className="flex flex-col gap-8">
           <div className="flex flex-col">
-            <div className="flex mb-4 border border-white/20 w-fit">
-              <button
-                onClick={() => setGenerator('voronoi')}
-                className={`px-4 py-2 text-sm font-semibold transition-colors ${
-                  generator === 'voronoi'
-                    ? 'bg-white text-black'
-                    : 'text-white/60 hover:text-white'
-                }`}
-              >
-                Voronoi
-              </button>
-              <button
-                onClick={() => setGenerator('stipple')}
-                className={`px-4 py-2 text-sm font-semibold transition-colors ${
-                  generator === 'stipple'
-                    ? 'bg-white text-black'
-                    : 'text-white/60 hover:text-white'
-                }`}
-              >
-                Particle trails
-              </button>
-            </div>
-
-            <div className="flex flex-wrap gap-3 mb-6">
+            {/* User controls */}
+            <div className="flex flex-wrap gap-3 mb-4">
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isBusy}
@@ -536,64 +620,86 @@ const ReversePage = () => {
               >
                 Re-seed
               </button>
-              {/* DEBUG: temporary toggle for the audio-state overlay. */}
-              {generator === 'stipple' && (
-                <button
-                  onClick={() => setShowDebug((v) => !v)}
-                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
-                    showDebug
-                      ? 'border-yellow-400/60 text-yellow-300 hover:bg-yellow-400/10'
-                      : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
-                  }`}
-                >
-                  Debug: {showDebug ? 'on' : 'off'}
-                </button>
-              )}
-              {generator === 'stipple' && (
-                <button
-                  onClick={() => setStationaryWells((v) => !v)}
-                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
-                    stationaryWells
-                      ? 'border-cyan-400/60 text-cyan-300 hover:bg-cyan-400/10'
-                      : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
-                  }`}
-                >
-                  Wells: {stationaryWells ? 'static' : 'moving'}
-                </button>
-              )}
-              {generator === 'stipple' && ['Bass', 'Mid', 'Treble'].map((label, b) => (
-                <button
-                  key={label}
-                  onClick={() => toggleBand(b)}
-                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
-                    bandsEnabled[b]
-                      ? 'border-white/60 text-white hover:bg-white/10'
-                      : 'border-white/20 text-white/30 hover:bg-white/5'
-                  }`}
-                >
-                  {label}: {bandsEnabled[b] ? 'on' : 'off'}
-                </button>
-              ))}
-              {generator === 'stipple' && ['particles', 'wells', 'events'].map((mode) => (
-                <button
-                  key={mode}
-                  onClick={() => toggleTraceMode(mode)}
-                  className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors ${
-                    traceModes[mode]
-                      ? 'border-fuchsia-400/60 text-fuchsia-300 hover:bg-fuchsia-400/10'
-                      : 'border-white/20 text-white/30 hover:bg-white/5'
-                  }`}
-                >
-                  Trace {mode}: {traceModes[mode] ? 'on' : 'off'}
-                </button>
-              ))}
+              <button
+                onClick={micActive ? stopMic : startMic}
+                disabled={isBusy}
+                className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors disabled:opacity-50 ${
+                  micActive
+                    ? 'border-red-400/60 text-red-300 hover:bg-red-400/10'
+                    : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                {micActive ? <MicOff size={16} /> : <Mic size={16} />}
+                {micActive ? 'Stop Mic' : 'Use Mic'}
+              </button>
               <button
                 onClick={downloadPng}
                 className="px-6 py-3 border border-white/30 text-white/70 font-semibold hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2"
               >
                 <Download size={16} />
-                Download PNG
+                Save etching
               </button>
+            </div>
+
+            {/* Dev tools — collapsible */}
+            <div className="mb-6">
+              <button
+                onClick={() => setShowDevTools((v) => !v)}
+                className="text-xs uppercase tracking-wider text-white/30 hover:text-white/60 transition-colors flex items-center gap-2 mb-3"
+              >
+                <span>{showDevTools ? '▾' : '▸'}</span>
+                Dev tools
+              </button>
+              {showDevTools && (
+                <div className="flex flex-wrap gap-3 pl-4 border-l border-white/10">
+                  <button
+                    onClick={() => setShowDebug((v) => !v)}
+                    className={`px-4 py-2 text-sm border font-semibold flex items-center gap-2 transition-colors ${
+                      showDebug
+                        ? 'border-yellow-400/60 text-yellow-300 hover:bg-yellow-400/10'
+                        : 'border-white/20 text-white/40 hover:bg-white/5 hover:text-white/70'
+                    }`}
+                  >
+                    Debug overlay: {showDebug ? 'on' : 'off'}
+                  </button>
+                  <button
+                    onClick={() => setStationaryWells((v) => !v)}
+                    className={`px-4 py-2 text-sm border font-semibold flex items-center gap-2 transition-colors ${
+                      stationaryWells
+                        ? 'border-cyan-400/60 text-cyan-300 hover:bg-cyan-400/10'
+                        : 'border-white/20 text-white/40 hover:bg-white/5 hover:text-white/70'
+                    }`}
+                  >
+                    Wells: {stationaryWells ? 'static' : 'moving'}
+                  </button>
+                  {['Bass', 'Mid', 'Treble'].map((label, b) => (
+                    <button
+                      key={label}
+                      onClick={() => toggleBand(b)}
+                      className={`px-4 py-2 text-sm border font-semibold flex items-center gap-2 transition-colors ${
+                        bandsEnabled[b]
+                          ? 'border-white/40 text-white/70 hover:bg-white/10'
+                          : 'border-white/10 text-white/20 hover:bg-white/5'
+                      }`}
+                    >
+                      {label}: {bandsEnabled[b] ? 'on' : 'off'}
+                    </button>
+                  ))}
+                  {['particles', 'wells', 'events'].map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => toggleTraceMode(mode)}
+                      className={`px-4 py-2 text-sm border font-semibold flex items-center gap-2 transition-colors ${
+                        traceModes[mode]
+                          ? 'border-fuchsia-400/60 text-fuchsia-300 hover:bg-fuchsia-400/10'
+                          : 'border-white/10 text-white/20 hover:bg-white/5'
+                      }`}
+                    >
+                      Trace {mode}: {traceModes[mode] ? 'on' : 'off'}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="flex gap-3 mb-6">
@@ -660,7 +766,7 @@ const ReversePage = () => {
               </p>
             )}
 
-            {generator === 'stipple' && audioUrl && (
+            {audioUrl && (
               <p className="mt-2 text-white/40 text-xs">
                 Press play — particles are pulled by live bass / mid / treble energy.
               </p>
