@@ -748,7 +748,7 @@ const ReversePage = () => {
               </div>
             </div>
 
-            {audioUrl && (
+            {audioUrl && status === 'done' && (
               <audio
                 key={audioUrl}
                 ref={audioRef}
@@ -766,7 +766,7 @@ const ReversePage = () => {
               </p>
             )}
 
-            {audioUrl && (
+            {audioUrl && status === 'done' && (
               <p className="mt-2 text-white/40 text-xs">
                 Press play — particles are pulled by live bass / mid / treble energy.
               </p>

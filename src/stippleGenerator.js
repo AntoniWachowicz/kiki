@@ -82,13 +82,20 @@ const PITCH_JUMP_THRESHOLD = 0.10;   // ≈ 5 semitones in normalized space — 
 const PITCH_JUMP_CONF = 0.30;        // jumps only fire when confidence is at least this high
 
 // ── Force tunings ───────────────────────────────────────────────────────────
-const ATTRACT_GAIN = 1.0;            // base mid-well pull magnitude
+const ATTRACT_GAIN = 0.45;           // base mid-well pull magnitude
 
-const REPEL_GAIN = 320;
+const REPEL_GAIN = 30;
 const REPEL_RADIUS = 100;
 const REPEL_RADIUS_SQ = REPEL_RADIUS * REPEL_RADIUS;
 const REPEL_SOFTENING = 30;
 const REPEL_SOFTENING_SQ = REPEL_SOFTENING * REPEL_SOFTENING;
+
+// Velocity alignment (Boids). Each particle is nudged toward the mean
+// velocity of its spatial neighbours. Oscillating particles bleed their
+// bounce into the surrounding drift rather than returning to the same spot.
+const ALIGN_RADIUS    = 90;
+const ALIGN_RADIUS_SQ = ALIGN_RADIUS * ALIGN_RADIUS;
+const ALIGN_GAIN      = 0.06;
 
 // Per-particle organic noise. No audio coupling — pure baseline life
 // for the field. Treble's character coupling now lives in the field-
@@ -113,44 +120,26 @@ const TREBLE_DAMPING_BOOST = 0.02;       // DAMPING shifts from 0.86 → 0.88 ma
                                          // (higher = slightly more inertia
                                          //  preserved on impulses)
 
-// ── Bass satellites ─────────────────────────────────────────────────────────
-const BASS_SAT_COUNT = 2;
+// ── Bass well (single gravity well) ─────────────────────────────────────────
+const BASS_SAT_COUNT = 1;
 const SAT_DRIFT_FREQ_X = 0.0030;
 const SAT_DRIFT_FREQ_Y = 0.0040;
-const SAT_DRIFT_AMP_FRAC = 0.13;     // of minDim — wider Lissajous swing
-const SAT_GAIN = 500;
-const SAT_RADIUS = 280;
-const SAT_RADIUS_SQ = SAT_RADIUS * SAT_RADIUS;
+const SAT_DRIFT_AMP_FRAC = 0.13;
+const SAT_GAIN = 200;
+const SAT_RADIUS = 80;               // base influence radius
+const SAT_RADIUS_EXPAND = 0.3;       // extra radius per unit of s0 (louder = wider reach)
 const SAT_SOFTENING = 50;
 const SAT_SOFTENING_SQ = SAT_SOFTENING * SAT_SOFTENING;
-const SAT_REPEL_FRAMES = 6;          // shorter repel window — was 8
-const SAT_REPEL_GAIN = 1.2;
-// Satellites are themselves pushed by other forces, so they don't just
-// sit waiting for the next bass onset.
-//   FLOW_GAIN — how strongly the curl flow field carries satellites.
-//     0.5 means satellites drift at half the rate of an unweighted
-//     particle in the same field. Treat them as "heavy."
-//   MUTUAL_REPEL — satellites push each other apart. Keeps the two of
-//     them from sitting near each other after random onset placements.
+const SAT_DRAG_GAIN = 5.0;           // how strongly well movement drags nearby particles
 const SAT_FLOW_GAIN = 0.5;
-const SAT_MUTUAL_REPEL_GAIN = 24000;
-const SAT_MUTUAL_REPEL_SOFTENING = 90;
-const SAT_MUTUAL_REPEL_SOFTENING_SQ = SAT_MUTUAL_REPEL_SOFTENING * SAT_MUTUAL_REPEL_SOFTENING;
-// On a bass onset the satellite picks a new target position. With prob
-// `teleportProb` (0 in pure bouba, ~0.5 at full kiki) it teleports there
-// instantly — the "disappear and reappear" beat. Otherwise it smoothly
-// slides toward the new target at `slideRate`. Slide rate scales with
-// angularity so bouba slides are gentle (~0.5 s) and kiki slides snap
-// (~0.25 s). Both styles travel further now thanks to `stepFrac` below.
-const SAT_TELEPORT_PROB_GAIN = 0.7;  // multiplier on (angularity - 0.3)
 const SAT_SLIDE_RATE_MIN = 0.04;
 const SAT_SLIDE_RATE_MAX = 0.14;
-const SAT_STEP_BASE = 0.06;          // step as fraction of minDim
+const SAT_STEP_BASE = 0.06;
 const SAT_STEP_PER_ANGULARITY = 0.45;
 
 // ── Bouba rotation / Kiki jerk ──────────────────────────────────────────────
 const BOUBA_ROT_GAIN = 0.03;
-const KIKI_JERK_MAG = 2.5;           // was 4 — kiki was too punchy
+const KIKI_JERK_MAG = 1.0;
 
 // ── Curl flow field ─────────────────────────────────────────────────────────
 // Always-on, slowly evolving vector field that pushes particles around in
@@ -182,14 +171,30 @@ const FLOW_PULSE_FREQ_MIN = 0.0015;  // ~70 s period at 86 fps
 const FLOW_PULSE_FREQ_MAX = 0.0050;  // ~21 s period
 
 // ── Integration ─────────────────────────────────────────────────────────────
-// Higher = more inertia retained between frames. Bumped from 0.78 so
-// particles follow gentle arcs from the structured forces (flow, wells,
-// rotation) instead of stop-start reactions to every transient impulse.
-// This is the biggest knob for "etched motion is calligraphic vs. jittery."
-const DAMPING = 0.82;
+// Velocity-dependent inertia: fast particles retain momentum (high effective
+// damping) while near-still particles stop quickly (low effective damping).
+// A kicked particle glides in a smooth arc then decelerates to rest — "fish
+// school" feel rather than oscillating around a fixed attractor.
+//   effectiveDamping = clamp(DAMPING_BASE + speed * DAMPING_INERTIA, _, DAMPING_MAX)
+const DAMPING_BASE    = 0.92;  // damping for nearly-still particles
+const DAMPING_INERTIA = 0.025; // additional damping per px/frame of speed
+const DAMPING_MAX     = 0.96;  // ceiling — fast particles coast a bit longer
 const EDGE_MARGIN = 14;
 const EDGE_FORCE = 0.35;
 const EDGE_BOUNCE = 0.4;
+
+// ── Trace line width ─────────────────────────────────────────────────────────
+// Particle segments scale from TRACE_WIDTH_MIN (near-still) to TRACE_WIDTH_MAX
+// (fast-moving). Speed is bucketed into TRACE_N_BUCKETS draw calls per frame
+// so we avoid one ctx.stroke() per particle.
+const TRACE_SPEED_THRESH   = 1.0; // px/frame — below this, no etching at all
+const TRACE_WELL_RADIUS    = 280; // px — beyond this from all wells, no etching
+const TRACE_WELL_RADIUS_SQ = TRACE_WELL_RADIUS * TRACE_WELL_RADIUS;
+const TRACE_WIDTH_MIN  = 0.5;
+const TRACE_WIDTH_MAX  = 4.0;
+const TRACE_SPEED_MAX  = 2.0;  // px/frame that maps to max width
+const TRACE_N_BUCKETS  = 5;
+const TRACE_WIDTH_CURVE = 3.0; // power applied to t before width lerp — >1 biases toward thin
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -244,14 +249,6 @@ export function createStippleSession(features, seed, width, height) {
   const noiseSpeedScale = 0.85 + complexity * 0.5;
   const boubaAmt = Math.max(0, 1 - angularity * 1.4);
   const kikiAmt = Math.max(0, angularity - 0.3) * 1.4;
-  // Capped at ~0.6 instead of ~0.96 — the flip-to-repel was firing on
-  // almost every kiki onset, which is what made kiki feel chaotic.
-  const satFlipProb = Math.max(0, angularity - 0.4) * 1.0;
-  // Bass-satellite onset behaviour: at angularity ≤ 0.3 the satellite
-  // always smoothly slides; above that, with rising probability it
-  // teleports instead. Slide rate also scales with angularity so kiki
-  // slides finish quickly while bouba slides take ~half a second.
-  const teleportProb = Math.max(0, angularity - 0.3) * SAT_TELEPORT_PROB_GAIN;
   const satSlideRate = SAT_SLIDE_RATE_MIN + angularity * (SAT_SLIDE_RATE_MAX - SAT_SLIDE_RATE_MIN);
 
   const minDim = Math.min(width, height);
@@ -385,7 +382,7 @@ export function createStippleSession(features, seed, width, height) {
         freqY: SAT_DRIFT_FREQ_Y * (0.7 + rng() * 0.6),
         phaseX: rng() * Math.PI * 2,
         phaseY: rng() * Math.PI * 2,
-        repelFrames: 0,
+        strength: 0,
       };
     }
 
@@ -415,6 +412,10 @@ export function createStippleSession(features, seed, width, height) {
         // so the "currently in the flow" subset rotates over time.
         flowFreq: FLOW_PULSE_FREQ_MIN + rng() * (FLOW_PULSE_FREQ_MAX - FLOW_PULSE_FREQ_MIN),
         flowPhase: rng() * Math.PI * 2,
+        // Per-particle repulsion strength. Log-uniform [0.15, 2.4] so a few
+        // particles carve large voids while most are passive and pack tightly.
+        // Radius stays global (grid correctness); only push magnitude varies.
+        repelScale: Math.exp(rng() * Math.log(16) - Math.log(6.67)),
         role,
         midW: profile.midW,
         satW: profile.satW,
@@ -429,6 +430,11 @@ export function createStippleSession(features, seed, width, height) {
   // accumulation line and the dark halo it creates are off-screen.
   // Particles can wander into the overshoot zone; the canvas clips them when
   // drawing so nothing appears outside the visible area.
+  // Pre-allocated per-bucket index lists for velocity-width batching.
+  // Filled and drained each drawTraces() call — no per-frame heap allocation.
+  const trBuckets = Array.from({ length: TRACE_N_BUCKETS }, () => new Int32Array(N_PARTICLES));
+  const trCounts  = new Int32Array(TRACE_N_BUCKETS);
+
   const overshoot = Math.round(Math.min(width, height) * 0.04);
   const physX0 = -overshoot;
   const physX1 =  width  + overshoot;
@@ -459,17 +465,11 @@ export function createStippleSession(features, seed, width, height) {
         onsetFired[b] = true;
 
         if (b === 0) {
-          // BASS: pick one satellite, compute a new target position, then
-          // either teleport (instant snap) or shift (smooth slide). Step
-          // size grows with angularity so kiki swings travel further.
-          // Sliding from `targetX,Y` (not `baseX,Y`) so successive shifts
-          // chain — a flurry of onsets sends the satellite further each
-          // time instead of bouncing around the previous anchor.
-          // In stationaryWells mode we still flip to repel (so onsets
-          // still register on the field) but skip the relocation.
-          const sIdx = Math.floor(rng() * satellites.length);
-          const sat = satellites[sIdx];
-          lastBassSat = sIdx;
+          // BASS: drift the well toward a new target on each onset.
+          // Successive onsets chain from the previous target so the well
+          // roams continuously rather than bouncing around one anchor.
+          const sat = satellites[0];
+          lastBassSat = 0;
           if (!stationaryWells) {
             const stepFrac = SAT_STEP_BASE + angularity * SAT_STEP_PER_ANGULARITY;
             const ang = rng() * Math.PI * 2;
@@ -482,16 +482,6 @@ export function createStippleSession(features, seed, width, height) {
             else if (ny > height * 0.85) ny = height * 0.85;
             sat.targetX = nx;
             sat.targetY = ny;
-            if (rng() < teleportProb) {
-              // Instant — the "disappear and reappear" beat.
-              sat.baseX = nx;
-              sat.baseY = ny;
-            }
-          }
-          // Flip to repel only on teleporting kicks; smooth-slide onsets
-          // don't get the explosive push, which calms kiki considerably.
-          if (satFlipProb > 0 && rng() < satFlipProb) {
-            sat.repelFrames = SAT_REPEL_FRAMES;
           }
         } else if (b === 1) {
           // MID: kiki jerk for stripe particles, one frame.
@@ -542,7 +532,8 @@ export function createStippleSession(features, seed, width, height) {
       1,
       smoothLevels[2] * TREBLE_TENSION_LEVEL_GAIN + onset[2] * TREBLE_TENSION_ONSET_GAIN,
     );
-    const effectiveDamping = DAMPING + trebleTension * TREBLE_DAMPING_BOOST;
+    // dampingBase feeds into per-particle velocity-dependent damping below.
+    const dampingBase = DAMPING_BASE + trebleTension * TREBLE_DAMPING_BOOST;
     const effectiveRepelGain = REPEL_GAIN * (1 + trebleTension * TREBLE_REPEL_BOOST);
 
     // Curl flow field: per-frame gain (audio-modulated) and time argument.
@@ -566,31 +557,7 @@ export function createStippleSession(features, seed, width, height) {
     const xMax = width * 0.90;
     const yMin = height * 0.10;
     const yMax = height * 0.90;
-    if (!stationaryWells) {
-      // (a) Mutual repulsion between satellite anchors.
-      for (let i = 0; i < satellites.length; i++) {
-        const a = satellites[i];
-        for (let j = 0; j < satellites.length; j++) {
-          if (i === j) continue;
-          const b = satellites[j];
-          const ddx = a.baseX - b.baseX;
-          const ddy = a.baseY - b.baseY;
-          const dist2soft = ddx * ddx + ddy * ddy + SAT_MUTUAL_REPEL_SOFTENING_SQ;
-          const distSoft = Math.sqrt(dist2soft);
-          const f = SAT_MUTUAL_REPEL_GAIN / dist2soft;
-          const px = (ddx / distSoft) * f;
-          const py = (ddy / distSoft) * f;
-          a.baseX += px;
-          a.baseY += py;
-          a.targetX += px;
-          a.targetY += py;
-        }
-      }
-    }
-    // (b) Curl-flow drift + (c) onset-driven slide + Lissajous around
-    // the resulting anchor; cache signed strength for the particle loop.
-    // In stationary mode we skip all the position math (sat stays at its
-    // seed baseX/Y) but still update the signedStrength so onsets pulse.
+    // Curl-flow drift + onset-driven slide + Lissajous around the anchor.
     for (let s = 0; s < satellites.length; s++) {
       const sat = satellites[s];
       if (!stationaryWells) {
@@ -602,13 +569,10 @@ export function createStippleSession(features, seed, width, height) {
         sat.baseY += flowVy;
         sat.targetX += flowVx;
         sat.targetY += flowVy;
-        // Clamp to a 10–90 % margin so flow + repel can't park them on the
-        // canvas edge where their gravity well would be half-cut.
         if (sat.baseX < xMin) sat.baseX = xMin; else if (sat.baseX > xMax) sat.baseX = xMax;
         if (sat.baseY < yMin) sat.baseY = yMin; else if (sat.baseY > yMax) sat.baseY = yMax;
         if (sat.targetX < xMin) sat.targetX = xMin; else if (sat.targetX > xMax) sat.targetX = xMax;
         if (sat.targetY < yMin) sat.targetY = yMin; else if (sat.targetY > yMax) sat.targetY = yMax;
-        // Slide toward target then apply Lissajous drift on top.
         sat.baseX += (sat.targetX - sat.baseX) * satSlideRate;
         sat.baseY += (sat.targetY - sat.baseY) * satSlideRate;
         sat.x = sat.baseX + Math.sin(t * sat.freqX + sat.phaseX) * satDriftAmp;
@@ -617,9 +581,7 @@ export function createStippleSession(features, seed, width, height) {
         sat.x = sat.baseX;
         sat.y = sat.baseY;
       }
-      if (sat.repelFrames > 0) sat.repelFrames--;
-      const sign = sat.repelFrames > 0 ? -SAT_REPEL_GAIN : 1;
-      sat.signedStrength = sign * s0;
+      sat.strength = s0;
     }
     // (c) Mid stripe Y target — blend of pitch contour (when melody is
     //     detected) and slow curl-flow bob (when it isn't). Locked at
@@ -678,11 +640,12 @@ export function createStippleSession(features, seed, width, height) {
       const xWell = s1 * stripe * dx * sigmaSqX / (dx * dx + sigmaSqX);
       fx += xWell / sigmaX * midHorizGain * p.midW;
 
-      // ── 2. Mutual repulsion via spatial grid ───────────────────────────
+      // ── 2. Mutual repulsion + velocity alignment via spatial grid ─────
       let cx = Math.floor(p.x / cellSize);
       let cy = Math.floor(p.y / cellSize);
       if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
       if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+      let alignVx = 0, alignVy = 0, alignN = 0;
       for (let dyG = -1; dyG <= 1; dyG++) {
         const ny = cy + dyG;
         if (ny < 0 || ny >= rows) continue;
@@ -697,29 +660,48 @@ export function createStippleSession(features, seed, width, height) {
             const ddx = p.x - q.x;
             const ddy = p.y - q.y;
             const dist2 = ddx * ddx + ddy * ddy;
-            if (dist2 >= REPEL_RADIUS_SQ || dist2 < 0.0001) continue;
-            const cutoff = 1 - dist2 / REPEL_RADIUS_SQ;
-            const k_ = effectiveRepelGain * cutoff / (dist2 + REPEL_SOFTENING_SQ);
-            fx += ddx * k_;
-            fy += ddy * k_;
+            if (dist2 < REPEL_RADIUS_SQ && dist2 > 0.0001) {
+              const cutoff = 1 - dist2 / REPEL_RADIUS_SQ;
+              const k_ = effectiveRepelGain * q.repelScale * cutoff / (dist2 + REPEL_SOFTENING_SQ);
+              fx += ddx * k_;
+              fy += ddy * k_;
+            }
+            if (dist2 < ALIGN_RADIUS_SQ) {
+              alignVx += q.vx;
+              alignVy += q.vy;
+              alignN++;
+            }
           }
         }
       }
+      if (alignN > 0) {
+        fx += (alignVx / alignN - p.vx) * ALIGN_GAIN;
+        fy += (alignVy / alignN - p.vy) * ALIGN_GAIN;
+      }
 
-      // ── 3. Bass satellites ─────────────────────────────────────────────
-      // Scaled by p.satW so orbit particles get pulled ~2× harder and
-      // shimmer particles ignore the satellites almost completely.
+      // ── 3. Bass gravity well ───────────────────────────────────────────
+      // Radius expands with bass level so louder passages cast a wider net.
+      // Drag transfers the well's own frame velocity to nearby particles so
+      // they get swept along as it roams rather than just pulled to its centre.
       for (let s = 0; s < satellites.length; s++) {
         const sat = satellites[s];
-        if (Math.abs(sat.signedStrength) < 0.01) continue;
+        if (sat.strength < 0.01) continue;
+        const effectiveRadius = SAT_RADIUS * (1 + sat.strength * SAT_RADIUS_EXPAND);
+        const effectiveRadiusSq = effectiveRadius * effectiveRadius;
         const sdx = sat.x - p.x;
         const sdy = sat.y - p.y;
         const sdist2 = sdx * sdx + sdy * sdy;
-        if (sdist2 >= SAT_RADIUS_SQ) continue;
-        const sCutoff = 1 - sdist2 / SAT_RADIUS_SQ;
-        const sk = sat.signedStrength * SAT_GAIN * sCutoff / (sdist2 + SAT_SOFTENING_SQ) * p.satW;
+        if (sdist2 >= effectiveRadiusSq) continue;
+        const sCutoff = 1 - sdist2 / effectiveRadiusSq;
+        // Attraction toward well centre
+        const sk = sat.strength * SAT_GAIN * sCutoff / (sdist2 + SAT_SOFTENING_SQ) * p.satW;
         fx += sdx * sk;
         fy += sdy * sk;
+        // Drag: push particle in the direction the well moved this frame
+        const wellVx = sat.x - sat.prevX;
+        const wellVy = sat.y - sat.prevY;
+        fx += wellVx * SAT_DRAG_GAIN * sCutoff * p.satW;
+        fy += wellVy * SAT_DRAG_GAIN * sCutoff * p.satW;
       }
 
       // ── 4. Curl flow field ─────────────────────────────────────────────
@@ -783,8 +765,10 @@ export function createStippleSession(features, seed, width, height) {
       if (p.y < physY0 + EDGE_MARGIN) fy += (physY0 + EDGE_MARGIN - p.y) * EDGE_FORCE;
       else if (p.y > physY1 - EDGE_MARGIN) fy -= (p.y - (physY1 - EDGE_MARGIN)) * EDGE_FORCE;
 
-      p.vx = (p.vx + fx) * effectiveDamping;
-      p.vy = (p.vy + fy) * effectiveDamping;
+      const spd = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+      const velDamping = Math.min(DAMPING_MAX, dampingBase + spd * DAMPING_INERTIA);
+      p.vx = (p.vx + fx) * velDamping;
+      p.vy = (p.vy + fy) * velDamping;
       p.x += p.vx;
       p.y += p.vy;
 
@@ -841,30 +825,20 @@ export function createStippleSession(features, seed, width, height) {
       const sat = satellites[s];
       const strength = smoothLevels[0] + onset[0] * 0.6;
       // Influence halo
+      const effectiveR = SAT_RADIUS * (1 + strength * SAT_RADIUS_EXPAND);
       ctx.strokeStyle = 'rgba(255,255,255,0.10)';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(sat.x, sat.y, SAT_RADIUS, 0, Math.PI * 2);
+      ctx.arc(sat.x, sat.y, effectiveR, 0, Math.PI * 2);
       ctx.stroke();
-      // Centre marker: filled disc when attracting, hollow ring + slash
-      // when in the post-onset repel state.
       const r = 6 + strength * 14;
-      const isRepel = sat.repelFrames > 0;
       ctx.lineWidth = 2;
       ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
       ctx.beginPath();
       ctx.arc(sat.x, sat.y, r, 0, Math.PI * 2);
-      if (isRepel) {
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(sat.x - r, sat.y - r);
-        ctx.lineTo(sat.x + r, sat.y + r);
-        ctx.stroke();
-      } else {
-        ctx.fillStyle = 'rgba(255,255,255,0.45)';
-        ctx.fill();
-        ctx.stroke();
-      }
+      ctx.fill();
+      ctx.stroke();
     }
   }
 
@@ -939,17 +913,43 @@ export function createStippleSession(features, seed, width, height) {
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
-    // ── 1. Particles: every particle's segment, faint, accumulates ─────
+    // ── 1. Particles: velocity-width segments, faint, accumulate ────────
+    // Speed → lineWidth: TRACE_WIDTH_MIN (still) … TRACE_WIDTH_MAX (fast).
+    // Particles are sorted into TRACE_N_BUCKETS speed bands so we only need
+    // that many ctx.stroke() calls instead of one per particle.
     if (traceModes.particles) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
+      trCounts.fill(0);
       for (let i = 0; i < N_PARTICLES; i++) {
         const p = particles[i];
-        ctx.moveTo(p.prevX, p.prevY);
-        ctx.lineTo(p.x, p.y);
+        const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        if (speed < TRACE_SPEED_THRESH) continue;
+        // Skip if far from every well. Mid stripe uses vertical distance only
+        // (it spans the full canvas width); satellites use 2D distance.
+        let nearWell = Math.abs(p.y - midYNow) < TRACE_WELL_RADIUS;
+        if (!nearWell) {
+          for (let s = 0; s < satellites.length; s++) {
+            const sat = satellites[s];
+            const dsx = p.x - sat.x, dsy = p.y - sat.y;
+            if (dsx * dsx + dsy * dsy < TRACE_WELL_RADIUS_SQ) { nearWell = true; break; }
+          }
+        }
+        if (!nearWell) continue;
+        const b = Math.min(TRACE_N_BUCKETS - 1, Math.floor(speed / TRACE_SPEED_MAX * TRACE_N_BUCKETS));
+        trBuckets[b][trCounts[b]++] = i;
       }
-      ctx.stroke();
+      for (let b = 0; b < TRACE_N_BUCKETS; b++) {
+        if (trCounts[b] === 0) continue;
+        const t = (b + 0.5) / TRACE_N_BUCKETS;
+        ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+        ctx.lineWidth = TRACE_WIDTH_MIN + Math.pow(t, TRACE_WIDTH_CURVE) * (TRACE_WIDTH_MAX - TRACE_WIDTH_MIN);
+        ctx.beginPath();
+        for (let k = 0; k < trCounts[b]; k++) {
+          const p = particles[trBuckets[b][k]];
+          ctx.moveTo(p.prevX, p.prevY);
+          ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
     }
 
     // ── 2. Wells: continuous strokes following the audio-driven structures ─
@@ -1043,6 +1043,14 @@ export function createStippleSession(features, seed, width, height) {
     }
     if (debug) drawDebugOverlay(ctx);
   }
+
+  // Pre-settle: run physics until particles reach equilibrium so the initial
+  // repulsion burst doesn't etch. drawTraces is never called here, so nothing
+  // is written to the trace canvas. 150 frames at DAMPING 0.82 reduces any
+  // velocity to <0.1% of its starting value (0.82^150 ≈ 0.0003).
+  const _silence = [0, 0, 0];
+  const _silencePitch = [0.5, 0];
+  for (let _i = 0; _i < 150; _i++) update(_silence, _silence, [0.5, 0.5, 0.5], _silencePitch);
 
   return { update, draw, drawTraces, reset, setDebug, setStationaryWells, setBandEnabled, setTraceMode };
 }
