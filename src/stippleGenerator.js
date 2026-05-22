@@ -1054,3 +1054,317 @@ export function createStippleSession(features, seed, width, height) {
 
   return { update, draw, drawTraces, reset, setDebug, setStationaryWells, setBandEnabled, setTraceMode };
 }
+
+// ── RGB Layer Session ────────────────────────────────────────────────────────
+// Three separate particle layers driven by bass / mid / treble respectively.
+// Each layer: one roaming satellite + ~90 orbit particles, rendered in a
+// pure primary colour (R / G / B). The trace canvas accumulates with additive
+// blending, so overlapping paths compose into yellow, cyan, magenta, and white.
+//
+// Bass   → red.   Slow large jumps. Big soft cloud.
+// Mid    → green. Medium speed and radius.
+// Treble → blue.  Fast small jitter. Tight darting cluster.
+
+// Per-layer tuning knobs
+const RGB_LAYER_N        = [90, 90, 90];         // particles per layer
+const RGB_COLORS         = ['255,0,0', '0,255,0', '0,0,255'];
+const RGB_DOT_SIZE       = [3, 2, 1];            // px — larger for slower bands
+const RGB_TRACE_WIDTH    = [1.5, 1.0, 0.6];      // stroke width on trace canvas
+const RGB_TRACE_ALPHA    = [0.18, 0.18, 0.22];
+const RGB_SAT_GAIN       = [260, 195, 135];      // attraction magnitude
+const RGB_SAT_RADIUS     = [118, 93, 62];        // base influence radius
+const RGB_DRIFT_FREQ_SCL = [0.70, 1.00, 1.80];  // scale on SAT_DRIFT_FREQ_*
+const RGB_DRIFT_AMP_FRAC = [0.12, 0.09, 0.05];  // fraction of minDim
+const RGB_SLIDE_RATE     = [0.035, 0.07, 0.13]; // how fast sat slides to target
+const RGB_STEP_FRAC      = [0.22, 0.14, 0.07];  // onset jump size (fraction of minDim)
+
+export function createRGBLayerSession(features, seed, width, height) {
+  const { angularity, complexity } = features;
+  const minDim = Math.min(width, height);
+  const cxCanvas = width / 2;
+  const cyCanvas = height / 2;
+  const fluxSensitivity = 1.2 + (1 - angularity) * 1.8;
+  const noiseSpeedScale = 0.85 + complexity * 0.5;
+  const boubaAmt = Math.max(0, 1 - angularity * 1.4);
+
+  const xMin = width * 0.10, xMax = width * 0.90;
+  const yMin = height * 0.10, yMax = height * 0.90;
+  const overshoot = Math.round(minDim * 0.04);
+  const physX0 = -overshoot, physX1 = width + overshoot;
+  const physY0 = -overshoot, physY1 = height + overshoot;
+
+  // Per-band audio state
+  const smoothLevels  = [0, 0, 0];
+  const fluxBaseline  = [0, 0, 0];
+  const onset         = [0, 0, 0];
+  const onsetCooldown = [0, 0, 0];
+
+  const satellites  = new Array(3);
+  const allParticles = [];
+  const grid = makeGrid(width, height, REPEL_RADIUS);
+
+  // Pre-allocated trace buckets — one set per layer
+  const rgbBuckets = RGB_COLORS.map(() =>
+    Array.from({ length: TRACE_N_BUCKETS }, () => new Int32Array(270))
+  );
+  const rgbCounts = RGB_COLORS.map(() => new Int32Array(TRACE_N_BUCKETS));
+
+  let rng = null;
+  let t   = 0;
+
+  function reset() {
+    rng = mulberry32(seed);
+    t   = 0;
+    for (let b = 0; b < 3; b++) {
+      smoothLevels[b] = fluxBaseline[b] = onset[b] = onsetCooldown[b] = 0;
+    }
+    allParticles.length = 0;
+
+    for (let layer = 0; layer < 3; layer++) {
+      const bx = (0.2 + rng() * 0.6) * width;
+      const by = (0.2 + rng() * 0.6) * height;
+      satellites[layer] = {
+        baseX: bx, baseY: by,
+        targetX: bx, targetY: by,
+        x: bx, y: by,
+        prevX: bx, prevY: by,
+        freqX: SAT_DRIFT_FREQ_X * RGB_DRIFT_FREQ_SCL[layer] * (0.7 + rng() * 0.6),
+        freqY: SAT_DRIFT_FREQ_Y * RGB_DRIFT_FREQ_SCL[layer] * (0.7 + rng() * 0.6),
+        phaseX: rng() * Math.PI * 2,
+        phaseY: rng() * Math.PI * 2,
+        driftAmp: RGB_DRIFT_AMP_FRAC[layer] * minDim,
+        strength: 0,
+      };
+
+      const N = RGB_LAYER_N[layer];
+      const offset = 1 + Math.floor(rng() * 97) + layer * 137;
+      for (let i = 0; i < N; i++) {
+        const px = (0.05 + halton(i + offset, 2) * 0.9) * width;
+        const py = (0.05 + halton(i + offset, 3) * 0.9) * height;
+        allParticles.push({
+          layer,
+          x: px, y: py,
+          prevX: px, prevY: py,
+          vx: 0, vy: 0,
+          freqA: NOISE_FREQ_MIN + rng() * (NOISE_FREQ_MAX - NOISE_FREQ_MIN),
+          freqB: NOISE_FREQ_MIN + rng() * (NOISE_FREQ_MAX - NOISE_FREQ_MIN),
+          phaseA: rng() * Math.PI * 2,
+          phaseB: rng() * Math.PI * 2,
+          flowFreq:  FLOW_PULSE_FREQ_MIN + rng() * (FLOW_PULSE_FREQ_MAX - FLOW_PULSE_FREQ_MIN),
+          flowPhase: rng() * Math.PI * 2,
+          repelScale: Math.exp(rng() * Math.log(16) - Math.log(6.67)),
+          size: RGB_DOT_SIZE[layer],
+        });
+      }
+    }
+  }
+
+  function update(rawLevels, rawFlux) {
+    t++;
+    for (let s = 0; s < 3; s++) { satellites[s].prevX = satellites[s].x; satellites[s].prevY = satellites[s].y; }
+
+    for (let b = 0; b < 3; b++) {
+      smoothLevels[b] += (rawLevels[b] - smoothLevels[b]) * LEVEL_SMOOTH;
+      fluxBaseline[b] += (rawFlux[b]   - fluxBaseline[b]) * FLUX_BASELINE_SMOOTH;
+      onset[b] *= ONSET_DECAY;
+      if (onsetCooldown[b] > 0) onsetCooldown[b]--;
+      const threshold = fluxBaseline[b] * fluxSensitivity + 0.012;
+      if (onsetCooldown[b] === 0 && rawFlux[b] > threshold) {
+        onset[b] = 1;
+        onsetCooldown[b] = ONSET_REFRACTORY;
+        const sat = satellites[b];
+        const stepFrac = RGB_STEP_FRAC[b];
+        const ang  = rng() * Math.PI * 2;
+        const step = (0.4 + rng() * 0.6) * minDim * stepFrac;
+        sat.targetX = Math.max(xMin, Math.min(xMax, sat.targetX + Math.cos(ang) * step));
+        sat.targetY = Math.max(yMin, Math.min(yMax, sat.targetY + Math.sin(ang) * step));
+      }
+    }
+
+    const audioEnergy = (smoothLevels[0] + smoothLevels[1] + smoothLevels[2]) / 3;
+    const flowGain  = FLOW_AMP_BASE + audioEnergy * FLOW_AMP_AUDIO;
+    const flowTime  = t * FLOW_T;
+    const flowTimeY = flowTime * 0.7;
+
+    // Update satellites (flow drift + slide + Lissajous)
+    for (let layer = 0; layer < 3; layer++) {
+      const sat = satellites[layer];
+      const fxArg = sat.baseX * FLOW_K + flowTime;
+      const fyArg = sat.baseY * FLOW_K - flowTimeY;
+      const flowVx = -Math.sin(fxArg) * Math.sin(fyArg) * flowGain * SAT_FLOW_GAIN;
+      const flowVy = -Math.cos(fxArg) * Math.cos(fyArg) * flowGain * SAT_FLOW_GAIN;
+      sat.baseX   = Math.max(xMin, Math.min(xMax, sat.baseX   + flowVx));
+      sat.baseY   = Math.max(yMin, Math.min(yMax, sat.baseY   + flowVy));
+      sat.targetX = Math.max(xMin, Math.min(xMax, sat.targetX + flowVx));
+      sat.targetY = Math.max(yMin, Math.min(yMax, sat.targetY + flowVy));
+      const sr = RGB_SLIDE_RATE[layer];
+      sat.baseX += (sat.targetX - sat.baseX) * sr;
+      sat.baseY += (sat.targetY - sat.baseY) * sr;
+      sat.x = sat.baseX + Math.sin(t * sat.freqX + sat.phaseX) * sat.driftAmp;
+      sat.y = sat.baseY + Math.cos(t * sat.freqY + sat.phaseY) * sat.driftAmp;
+      sat.strength = smoothLevels[layer] + onset[layer] * ONSET_BOOST;
+    }
+
+    rebuildGrid(grid, allParticles);
+    const { cols, rows, cellSize, buckets } = grid;
+
+    for (let i = 0; i < allParticles.length; i++) {
+      const p = allParticles[i];
+      p.prevX = p.x;
+      p.prevY = p.y;
+      let fx = 0, fy = 0;
+
+      // 1. Attraction toward own satellite
+      const sat = satellites[p.layer];
+      if (sat.strength >= 0.01) {
+        const effectiveRadius = RGB_SAT_RADIUS[p.layer] * (1 + sat.strength * SAT_RADIUS_EXPAND);
+        const effectiveRadiusSq = effectiveRadius * effectiveRadius;
+        const sdx = sat.x - p.x, sdy = sat.y - p.y;
+        const sdist2 = sdx * sdx + sdy * sdy;
+        if (sdist2 < effectiveRadiusSq) {
+          const sCutoff = 1 - sdist2 / effectiveRadiusSq;
+          const sk = sat.strength * RGB_SAT_GAIN[p.layer] * sCutoff / (sdist2 + SAT_SOFTENING_SQ);
+          fx += sdx * sk;
+          fy += sdy * sk;
+          fx += (sat.x - sat.prevX) * SAT_DRAG_GAIN * sCutoff;
+          fy += (sat.y - sat.prevY) * SAT_DRAG_GAIN * sCutoff;
+        }
+      }
+
+      // 2. Same-layer mutual repulsion via spatial grid
+      let cx = Math.floor(p.x / cellSize); if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+      let cy = Math.floor(p.y / cellSize); if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+      for (let dyG = -1; dyG <= 1; dyG++) {
+        const ny = cy + dyG; if (ny < 0 || ny >= rows) continue;
+        for (let dxG = -1; dxG <= 1; dxG++) {
+          const nx = cx + dxG; if (nx < 0 || nx >= cols) continue;
+          const cell = buckets[ny * cols + nx];
+          for (let k = 0; k < cell.length; k++) {
+            const j = cell[k]; if (j === i) continue;
+            const q = allParticles[j];
+            if (q.layer !== p.layer) continue;
+            const ddx = p.x - q.x, ddy = p.y - q.y;
+            const dist2 = ddx * ddx + ddy * ddy;
+            if (dist2 < REPEL_RADIUS_SQ && dist2 > 0.0001) {
+              const cutoff = 1 - dist2 / REPEL_RADIUS_SQ;
+              const k_ = REPEL_GAIN * q.repelScale * cutoff / (dist2 + REPEL_SOFTENING_SQ);
+              fx += ddx * k_; fy += ddy * k_;
+            }
+          }
+        }
+      }
+
+      // 3. Curl flow field (per-particle pulsed)
+      const flowPulse = Math.max(0, Math.sin(t * p.flowFreq + p.flowPhase));
+      if (flowPulse > 0) {
+        const fxArg = p.x * FLOW_K + flowTime;
+        const fyArg = p.y * FLOW_K - flowTimeY;
+        const flowMag = flowGain * flowPulse;
+        fx += -Math.sin(fxArg) * Math.sin(fyArg) * flowMag;
+        fy += -Math.cos(fxArg) * Math.cos(fyArg) * flowMag;
+      }
+
+      // 4. Bouba rotational drift
+      if (boubaAmt > 0) {
+        const dxC = p.x - cxCanvas, dyC = p.y - cyCanvas;
+        const dC = Math.sqrt(dxC * dxC + dyC * dyC) + 1;
+        fx += -dyC / dC * BOUBA_ROT_GAIN * boubaAmt;
+        fy +=  dxC / dC * BOUBA_ROT_GAIN * boubaAmt;
+      }
+
+      // 5. Per-particle organic noise
+      fx += Math.sin(t * p.freqA * noiseSpeedScale + p.phaseA) * NOISE_AMP_BASE;
+      fy += Math.cos(t * p.freqB * noiseSpeedScale + p.phaseB) * NOISE_AMP_BASE;
+
+      // Scale all motion forces to produce ~4× slower particles
+      fx *= 0.25;
+      fy *= 0.25;
+
+      // 6. Soft edge spring + hard bounce
+      if (p.x < physX0 + EDGE_MARGIN) fx += (physX0 + EDGE_MARGIN - p.x) * EDGE_FORCE;
+      else if (p.x > physX1 - EDGE_MARGIN) fx -= (p.x - (physX1 - EDGE_MARGIN)) * EDGE_FORCE;
+      if (p.y < physY0 + EDGE_MARGIN) fy += (physY0 + EDGE_MARGIN - p.y) * EDGE_FORCE;
+      else if (p.y > physY1 - EDGE_MARGIN) fy -= (p.y - (physY1 - EDGE_MARGIN)) * EDGE_FORCE;
+
+      const spd = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+      const velDamping = Math.min(DAMPING_MAX, DAMPING_BASE + spd * DAMPING_INERTIA);
+      p.vx = (p.vx + fx) * velDamping;
+      p.vy = (p.vy + fy) * velDamping;
+      p.x += p.vx; p.y += p.vy;
+
+      if (p.x < physX0) { p.x = physX0; p.vx =  Math.abs(p.vx) * EDGE_BOUNCE; }
+      else if (p.x > physX1) { p.x = physX1; p.vx = -Math.abs(p.vx) * EDGE_BOUNCE; }
+      if (p.y < physY0) { p.y = physY0; p.vy =  Math.abs(p.vy) * EDGE_BOUNCE; }
+      else if (p.y > physY1) { p.y = physY1; p.vy = -Math.abs(p.vy) * EDGE_BOUNCE; }
+    }
+  }
+
+  function draw(ctx) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, width, height);
+    for (let i = 0; i < allParticles.length; i++) {
+      const p = allParticles[i];
+      ctx.fillStyle = `rgb(${RGB_COLORS[p.layer]})`;
+      const half = p.size / 2;
+      ctx.fillRect(Math.round(p.x - half), Math.round(p.y - half), p.size, p.size);
+    }
+    // Satellite markers — pulsing rings at each well
+    for (let layer = 0; layer < 3; layer++) {
+      const sat = satellites[layer];
+      const r = 5 + sat.strength * 12;
+      ctx.strokeStyle = `rgba(${RGB_COLORS[layer]},0.70)`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(sat.x, sat.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  function drawTraces(ctx) {
+    // Additive blending: R+G→yellow, R+B→magenta, G+B→cyan, R+G+B→white
+    const prevComp = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+
+    for (let layer = 0; layer < 3; layer++) {
+      const counts = rgbCounts[layer];
+      const bkts   = rgbBuckets[layer];
+      counts.fill(0);
+
+      for (let i = 0; i < allParticles.length; i++) {
+        const p = allParticles[i];
+        if (p.layer !== layer) continue;
+        const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        if (speed < TRACE_SPEED_THRESH) continue;
+        const b = Math.min(TRACE_N_BUCKETS - 1, Math.floor(speed / TRACE_SPEED_MAX * TRACE_N_BUCKETS));
+        bkts[b][counts[b]++] = i;
+      }
+
+      const alpha = RGB_TRACE_ALPHA[layer];
+      for (let b = 0; b < TRACE_N_BUCKETS; b++) {
+        if (counts[b] === 0) continue;
+        const tFrac = (b + 0.5) / TRACE_N_BUCKETS;
+        const w = RGB_TRACE_WIDTH[layer] * (TRACE_WIDTH_MIN + Math.pow(tFrac, TRACE_WIDTH_CURVE) * (TRACE_WIDTH_MAX - TRACE_WIDTH_MIN)) / TRACE_WIDTH_MAX;
+        ctx.strokeStyle = `rgba(${RGB_COLORS[layer]},${alpha.toFixed(3)})`;
+        ctx.lineWidth = Math.max(0.5, w * 1.8);
+        ctx.beginPath();
+        for (let k = 0; k < counts[b]; k++) {
+          const p = allParticles[bkts[b][k]];
+          ctx.moveTo(p.prevX, p.prevY);
+          ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    ctx.globalCompositeOperation = prevComp;
+  }
+
+  reset();
+
+  // Pre-settle — let repulsion spread particles before audio starts
+  const _silence = [0, 0, 0];
+  for (let _i = 0; _i < 150; _i++) update(_silence, _silence);
+
+  return { update, draw, drawTraces, reset };
+}

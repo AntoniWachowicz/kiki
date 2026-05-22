@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { Upload, Download, AlertCircle, Play, Mic, MicOff } from 'lucide-react';
 import { analyzeAudioFile } from '../audioAnalysis';
-import { createStippleSession } from '../stippleGenerator';
+import { createStippleSession, createRGBLayerSession } from '../stippleGenerator';
 
 function hashString(s) {
   let h = 2166136261 >>> 0;
@@ -75,6 +75,7 @@ const ReversePage = () => {
   const lastFrameIdxRef = useRef(-1);
 
   const [showDevTools, setShowDevTools] = useState(false);
+  const [rgbLayerMode, setRgbLayerMode] = useState(false);
 
   // Live mic state
   const [micActive, setMicActive] = useState(false);
@@ -214,7 +215,7 @@ const ReversePage = () => {
     return () => { if (micRafRef.current) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; } };
   }, [micActive]);
 
-  // (Re)build a stipple session on feature/seed change and show the initial state.
+  // (Re)build a stipple session on feature/seed/mode change and show the initial state.
   // Playback then drives sim progress from audio.currentTime (see effect below).
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -222,7 +223,9 @@ const ReversePage = () => {
     const ctx = canvas.getContext('2d');
 
     try {
-      const session = createStippleSession(features, seed, CANVAS_SIZE, CANVAS_SIZE);
+      const session = rgbLayerMode
+        ? createRGBLayerSession(features, seed, CANVAS_SIZE, CANVAS_SIZE)
+        : createStippleSession(features, seed, CANVAS_SIZE, CANVAS_SIZE);
       stippleSessionRef.current = session;
       if (session.setDebug) session.setDebug(showDebug);
       if (session.setStationaryWells) session.setStationaryWells(stationaryWells);
@@ -240,7 +243,7 @@ const ReversePage = () => {
     } catch (err) {
       console.error('Stipple session failed:', err);
     }
-  }, [features, seed]);
+  }, [features, seed, rgbLayerMode]);
 
   // DEBUG: when the toggle changes, reflect it on the current session and
   // force a redraw so it's visible even while audio is paused.
@@ -481,16 +484,11 @@ const ReversePage = () => {
   };
 
   // Fetch any direct audio URL and run it through the pipeline. Browsers
-  // block YouTube / Spotify / SoundCloud streams via CORS + DRM, so this
-  // only works for hosts that serve a direct .mp3/.wav/.ogg/etc. file with
-  // permissive CORS headers (archive.org, FMA, Pixabay, ccMixter, etc.).
   const loadFromUrl = async () => {
     const raw = urlInput.trim();
     if (!raw) return;
     setError(null);
 
-    // Friendly bounce for known unsupported sources rather than the generic
-    // "failed to fetch" we'd get from CORS.
     if (/youtu\.?be|spotify|soundcloud|apple\.com\/.*music/i.test(raw)) {
       setError(
         "Streaming services don't expose audio to browsers. Paste a direct .mp3/.wav URL (try archive.org, Pixabay, ccMixter)."
@@ -507,9 +505,21 @@ const ReversePage = () => {
 
     setStatus('fetching');
     try {
-      const res = await fetch(raw);
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      // Bail before downloading a multi-hundred-MB file.
+      // Try a direct fetch first. If CORS blocks it (TypeError), retry via
+      // the server-side proxy at /api/proxy which has no CORS restrictions.
+      let res;
+      try {
+        res = await fetch(raw);
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      } catch (directErr) {
+        if (!(directErr instanceof TypeError)) throw directErr;
+        res = await fetch(`/api/proxy?url=${encodeURIComponent(raw)}`);
+        if (!res.ok) throw new Error(res.status === 413
+          ? await res.text()
+          : `HTTP ${res.status} ${res.statusText}`
+        );
+      }
+
       const lenHeader = res.headers.get('content-length');
       if (lenHeader && parseInt(lenHeader, 10) > 50 * 1024 * 1024) {
         throw new Error('Audio is larger than 50 MB.');
@@ -519,15 +529,7 @@ const ReversePage = () => {
       const label = filename.split('?')[0].replace(/\.[a-z0-9]+$/i, '') || 'remote-audio';
       await runPipeline(arrayBuffer, label, res.headers.get('content-type'));
     } catch (err) {
-      // A bare TypeError from fetch nearly always means CORS, since the
-      // browser surfaces network/CORS failures the same way.
-      if (err instanceof TypeError) {
-        setError(
-          "Couldn't fetch that URL — most likely the host blocks cross-origin requests (CORS). Try a different one."
-        );
-      } else {
-        setError(err.message || 'Failed to load URL');
-      }
+      setError(err.message || 'Failed to load URL');
       setStatus('idle');
     }
   };
@@ -619,6 +621,17 @@ const ReversePage = () => {
                 className="px-6 py-3 border border-white/30 text-white/70 font-semibold hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2 disabled:opacity-50"
               >
                 Re-seed
+              </button>
+              <button
+                onClick={() => setRgbLayerMode((v) => !v)}
+                disabled={isBusy}
+                className={`px-6 py-3 border font-semibold flex items-center gap-2 transition-colors disabled:opacity-50 ${
+                  rgbLayerMode
+                    ? 'border-fuchsia-400/60 text-fuchsia-300 hover:bg-fuchsia-400/10'
+                    : 'border-white/30 text-white/70 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                {rgbLayerMode ? 'RGB layers' : 'Standard'}
               </button>
               <button
                 onClick={micActive ? stopMic : startMic}
