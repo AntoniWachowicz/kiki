@@ -241,7 +241,7 @@ function rebuildGrid(grid, particles) {
   }
 }
 
-export function createStippleSession(features, seed, width, height) {
+export function createStippleSession(features, seed, width, height, nParticles = N_PARTICLES) {
   const { complexity, angularity } = features;
 
   const attractGain = ATTRACT_GAIN * (0.4 + angularity * 1.2);
@@ -292,7 +292,7 @@ export function createStippleSession(features, seed, width, height) {
   // Mid kiki jerk: -1, 0, or +1 for one frame after a mid onset.
   let midJerk = 0;
 
-  const particles = new Array(N_PARTICLES);
+  const particles = new Array(nParticles);
   let rng = null;
   // Separate RNG for the trace canvas (treble scatter etc.) so consuming
   // random numbers in drawTraces doesn't desync the sim's main rng. Both
@@ -387,7 +387,7 @@ export function createStippleSession(features, seed, width, height) {
     }
 
     const offset = 1 + Math.floor(rng() * 97);
-    for (let i = 0; i < N_PARTICLES; i++) {
+    for (let i = 0; i < nParticles; i++) {
       const r = rng();
       let role = ROLE_FLOW;
       if (r >= ROLE_CUM_PROB[0]) role = (r < ROLE_CUM_PROB[1]) ? ROLE_ORBIT : ROLE_SHIMMER;
@@ -432,7 +432,7 @@ export function createStippleSession(features, seed, width, height) {
   // drawing so nothing appears outside the visible area.
   // Pre-allocated per-bucket index lists for velocity-width batching.
   // Filled and drained each drawTraces() call — no per-frame heap allocation.
-  const trBuckets = Array.from({ length: TRACE_N_BUCKETS }, () => new Int32Array(N_PARTICLES));
+  const trBuckets = Array.from({ length: TRACE_N_BUCKETS }, () => new Int32Array(nParticles));
   const trCounts  = new Int32Array(TRACE_N_BUCKETS);
 
   const overshoot = Math.round(Math.min(width, height) * 0.04);
@@ -618,7 +618,7 @@ export function createStippleSession(features, seed, width, height) {
     rebuildGrid(grid, particles);
     const { cols, rows, cellSize, buckets } = grid;
 
-    for (let i = 0; i < N_PARTICLES; i++) {
+    for (let i = 0; i < nParticles; i++) {
       const p = particles[i];
       // Snapshot before integration — the trace canvas draws segments from
       // (prevX, prevY) → (x, y) using these.
@@ -871,7 +871,7 @@ export function createStippleSession(features, seed, width, height) {
     // Role count readout below the bars. Counts are static for the
     // session but useful as a sanity check on the population mix.
     let cFlow = 0, cOrbit = 0, cShimmer = 0;
-    for (let i = 0; i < N_PARTICLES; i++) {
+    for (let i = 0; i < nParticles; i++) {
       const r = particles[i].role;
       if (r === ROLE_FLOW) cFlow++;
       else if (r === ROLE_ORBIT) cOrbit++;
@@ -919,19 +919,16 @@ export function createStippleSession(features, seed, width, height) {
     // that many ctx.stroke() calls instead of one per particle.
     if (traceModes.particles) {
       trCounts.fill(0);
-      for (let i = 0; i < N_PARTICLES; i++) {
+      for (let i = 0; i < nParticles; i++) {
         const p = particles[i];
         const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
         if (speed < TRACE_SPEED_THRESH) continue;
-        // Skip if far from every well. Mid stripe uses vertical distance only
-        // (it spans the full canvas width); satellites use 2D distance.
-        let nearWell = Math.abs(p.y - midYNow) < TRACE_WELL_RADIUS;
-        if (!nearWell) {
-          for (let s = 0; s < satellites.length; s++) {
-            const sat = satellites[s];
-            const dsx = p.x - sat.x, dsy = p.y - sat.y;
-            if (dsx * dsx + dsy * dsy < TRACE_WELL_RADIUS_SQ) { nearWell = true; break; }
-          }
+        // Only etch particles within range of a bass satellite.
+        let nearWell = false;
+        for (let s = 0; s < satellites.length; s++) {
+          const sat = satellites[s];
+          const dsx = p.x - sat.x, dsy = p.y - sat.y;
+          if (dsx * dsx + dsy * dsy < TRACE_WELL_RADIUS_SQ) { nearWell = true; break; }
         }
         if (!nearWell) continue;
         const b = Math.min(TRACE_N_BUCKETS - 1, Math.floor(speed / TRACE_SPEED_MAX * TRACE_N_BUCKETS));
@@ -1035,7 +1032,7 @@ export function createStippleSession(features, seed, width, height) {
     // Per-particle size derived from role. Round the origin so 1 px
     // shimmer dots land cleanly on the pixel grid (otherwise sub-pixel
     // positions get smeared by Canvas anti-aliasing into 2-px fuzz).
-    for (let i = 0; i < N_PARTICLES; i++) {
+    for (let i = 0; i < nParticles; i++) {
       const p = particles[i];
       const s = p.size;
       const half = s / 2;

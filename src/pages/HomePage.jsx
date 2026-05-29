@@ -27,6 +27,12 @@ const HomePage = () => {
               showcase
             </Link>
             <Link
+              to="/reverse"
+              className="inline-block px-8 py-3 border border-white text-white font-semibold hover:bg-white/10 transition-colors"
+            >
+              reverse
+            </Link>
+            <Link
               to="/app"
               className="inline-block px-8 py-3 bg-white text-black font-semibold hover:bg-white/90 transition-colors"
             >

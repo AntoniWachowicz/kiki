@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { Upload, Download, AlertCircle, Play, Mic, MicOff } from 'lucide-react';
 import { analyzeAudioFile } from '../audioAnalysis';
 import { createStippleSession, createRGBLayerSession } from '../stippleGenerator';
+import CompareView from '../components/CompareView';
 
 function hashString(s) {
   let h = 2166136261 >>> 0;
@@ -76,6 +77,7 @@ const ReversePage = () => {
 
   const [showDevTools, setShowDevTools] = useState(false);
   const [rgbLayerMode, setRgbLayerMode] = useState(false);
+  const [compareMode, setCompareMode] = useState(false);
 
   // Live mic state
   const [micActive, setMicActive] = useState(false);
@@ -742,32 +744,47 @@ const ReversePage = () => {
               className="hidden"
             />
 
-            <div className="flex gap-4">
-              <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
-                <canvas
-                  ref={canvasRef}
-                  width={CANVAS_SIZE}
-                  height={CANVAS_SIZE}
-                  className="w-full h-full object-contain"
-                />
+            {!compareMode && (
+              <div className="flex gap-4">
+                <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
+                  <canvas
+                    ref={canvasRef}
+                    width={CANVAS_SIZE}
+                    height={CANVAS_SIZE}
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+                <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
+                  <canvas
+                    ref={traceCanvasRef}
+                    width={CANVAS_SIZE}
+                    height={CANVAS_SIZE}
+                    className="w-full h-full object-contain"
+                  />
+                </div>
               </div>
-              <div className="border border-white/20 bg-black aspect-square flex-1 min-w-0">
-                <canvas
-                  ref={traceCanvasRef}
-                  width={CANVAS_SIZE}
-                  height={CANVAS_SIZE}
-                  className="w-full h-full object-contain"
-                />
-              </div>
-            </div>
+            )}
 
-            {audioUrl && status === 'done' && (
+            {compareMode && (
+              <CompareView
+                timelineRef={timelineRef}
+                audioRef={audioRef}
+                features={features}
+                seed={seed}
+                micActive={micActive}
+                micAnalyserRef={micAnalyserRef}
+                micContextRef={micContextRef}
+                status={status}
+              />
+            )}
+
+            {audioUrl && (
               <audio
                 key={audioUrl}
                 ref={audioRef}
                 src={audioUrl}
                 controls
-                className="w-full mt-4"
+                className={`w-full mt-4${status !== 'done' ? ' opacity-40 pointer-events-none' : ''}`}
               />
             )}
 
@@ -784,6 +801,19 @@ const ReversePage = () => {
                 Press play — particles are pulled by live bass / mid / treble energy.
               </p>
             )}
+
+            <div className="mt-8 flex justify-center border-t border-white/10 pt-6">
+              <button
+                onClick={() => setCompareMode(v => !v)}
+                className={`px-8 py-3 border font-semibold transition-colors text-sm uppercase tracking-wider ${
+                  compareMode
+                    ? 'border-white/60 text-white hover:bg-white/10'
+                    : 'border-white/20 text-white/50 hover:border-white/40 hover:text-white/80'
+                }`}
+              >
+                {compareMode ? '← single view' : 'compare 4 systems →'}
+              </button>
+            </div>
           </div>
 
           <div className="flex flex-col">
