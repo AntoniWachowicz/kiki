@@ -87,8 +87,9 @@ const ExhibitionPage = () => {
 
   const [started, setStarted] = useState(false);
   const [error, setError]     = useState(null);
-  // Briefly true after each successful upload — lights the status dot.
   const [syncing, setSyncing] = useState(false);
+  // Temporary debug status — remove once capture is confirmed working
+  const [dbg, setDbg] = useState('waiting…');
 
   // Init canvases and particle session on mount
   useEffect(() => {
@@ -275,12 +276,16 @@ const ExhibitionPage = () => {
   // Auto-capture: composite both canvases → JPEG → imgBB → relay to Redis
   useEffect(() => {
     if (!started) return;
-    if (!import.meta.env.VITE_IMGBB_API_KEY) return;
 
-    const captureAndUpload = () => {
+    const apiKey = import.meta.env.VITE_IMGBB_API_KEY;
+    if (!apiKey) { setDbg('NO KEY — VITE_IMGBB_API_KEY missing from build'); return; }
+
+    const captureAndUpload = async () => {
       const particleCanvas = canvasRef.current;
       const traceCanvas    = traceCanvasRef.current;
       if (!particleCanvas || !traceCanvas) return;
+
+      setDbg('capturing…');
 
       // Composite trace + particles on an offscreen canvas for export.
       const offscreen = document.createElement('canvas');
@@ -292,23 +297,26 @@ const ExhibitionPage = () => {
       octx.drawImage(particleCanvas, 0, 0);
       octx.globalCompositeOperation = 'source-over';
 
-      offscreen.toBlob(async (blob) => {
-        if (!blob) return;
-        const url = await uploadToImgBB(blob);
-        if (!url) return;
-        setSyncing(true);
-        try {
-          await fetch('/api/set-image', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url }),
-          });
-        } catch {
-          // silently ignore — next capture will retry
-        }
-        // Flash status dot for 1.5 s so the exhibitor can see uploads are live
-        setTimeout(() => setSyncing(false), 1500);
-      }, 'image/jpeg', 0.92);
+      const blob = await new Promise(res => offscreen.toBlob(res, 'image/jpeg', 0.92));
+      if (!blob) { setDbg('ERR: toBlob returned null'); return; }
+
+      setDbg(`blob ok (${(blob.size/1024).toFixed(0)} KB) — uploading to imgBB…`);
+      const url = await uploadToImgBB(blob);
+      if (!url) { setDbg('ERR: imgBB upload failed (check key + network)'); return; }
+
+      setDbg(`imgBB ok — relaying to Redis…`);
+      setSyncing(true);
+      try {
+        const r = await fetch('/api/set-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        setDbg(r.ok ? `done ✓  ${new Date().toLocaleTimeString()}` : `ERR: set-image returned ${r.status}`);
+      } catch (e) {
+        setDbg(`ERR: set-image fetch threw — ${e.message}`);
+      }
+      setTimeout(() => setSyncing(false), 1500);
     };
 
     // First capture after 5 s (let animation settle), then every 30 s
@@ -359,7 +367,11 @@ const ExhibitionPage = () => {
         </div>
       )}
 
-      {/* Upload status indicator — tiny dot, bottom-left, pulses briefly after each sync */}
+      {/* Temporary debug overlay — remove once capture is confirmed working */}
+      {started && (
+        <p className="absolute bottom-6 left-6 text-white/50 text-xs font-mono">{dbg}</p>
+      )}
+
       {started && syncing && (
         <div className="absolute bottom-6 left-6 w-1.5 h-1.5 rounded-full bg-white/30 animate-pulse" />
       )}
