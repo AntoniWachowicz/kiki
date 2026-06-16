@@ -282,14 +282,33 @@ const ExhibitionPage = () => {
       if (!particleCanvas || !traceCanvas) return;
 
       // Composite trace + particles on an offscreen canvas for export.
+      const { dpr } = canvasSizeRef.current;
+      const stripeH  = Math.round(72 * dpr);
+      const fontSize = Math.round(17 * dpr);
+
       const offscreen = document.createElement('canvas');
       offscreen.width  = particleCanvas.width;
-      offscreen.height = particleCanvas.height;
+      offscreen.height = particleCanvas.height + stripeH;
       const octx = offscreen.getContext('2d');
+
       octx.drawImage(traceCanvas, 0, 0);
       octx.globalCompositeOperation = 'screen';
       octx.drawImage(particleCanvas, 0, 0);
       octx.globalCompositeOperation = 'source-over';
+
+      // Black stripe appended below the image
+      octx.fillStyle = '#000000';
+      octx.fillRect(0, particleCanvas.height, particleCanvas.width, stripeH);
+
+      octx.fillStyle = '#ffffff';
+      octx.font = `${fontSize}px Consolas, monospace`;
+      octx.textAlign = 'center';
+      octx.textBaseline = 'middle';
+      octx.fillText(
+        'Instagram  @olqwznm  @anthony_80808',
+        particleCanvas.width / 2,
+        particleCanvas.height + stripeH / 2
+      );
 
       const blob = await new Promise(res => offscreen.toBlob(res, 'image/jpeg', 0.92));
       if (!blob) return;
