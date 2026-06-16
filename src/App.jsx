@@ -5,6 +5,9 @@ import ShowcasePage from './pages/ShowcasePage';
 import AppPage from './pages/AppPage';
 import DevToolsPage from './pages/DevToolsPage';
 import ReversePage from './pages/ReversePage';
+import ExhibitionPage from './pages/ExhibitionPage';
+import CapturePage from './pages/CapturePage';
+import ExhibitQRPage from './pages/ExhibitQRPage';
 
 const App = () => {
   return (
@@ -14,6 +17,9 @@ const App = () => {
       <Route path="/app" element={<AppPage />} />
       <Route path="/dev" element={<DevToolsPage />} />
       <Route path="/reverse" element={<ReversePage />} />
+      <Route path="/exhibit" element={<ExhibitionPage />} />
+      <Route path="/capture" element={<CapturePage />} />
+      <Route path="/exhibit-qr" element={<ExhibitQRPage />} />
     </Routes>
   );
 };
