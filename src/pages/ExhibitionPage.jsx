@@ -88,8 +88,6 @@ const ExhibitionPage = () => {
   const [started, setStarted] = useState(false);
   const [error, setError]     = useState(null);
   const [syncing, setSyncing] = useState(false);
-  // Temporary debug status — remove once capture is confirmed working
-  const [dbg, setDbg] = useState('waiting…');
 
   // Init canvases and particle session on mount
   useEffect(() => {
@@ -276,16 +274,12 @@ const ExhibitionPage = () => {
   // Auto-capture: composite both canvases → JPEG → imgBB → relay to Redis
   useEffect(() => {
     if (!started) return;
-
-    const apiKey = import.meta.env.VITE_IMGBB_API_KEY;
-    if (!apiKey) { setDbg('NO KEY — VITE_IMGBB_API_KEY missing from build'); return; }
+    if (!import.meta.env.VITE_IMGBB_API_KEY) return;
 
     const captureAndUpload = async () => {
       const particleCanvas = canvasRef.current;
       const traceCanvas    = traceCanvasRef.current;
       if (!particleCanvas || !traceCanvas) return;
-
-      setDbg('capturing…');
 
       // Composite trace + particles on an offscreen canvas for export.
       const offscreen = document.createElement('canvas');
@@ -298,23 +292,20 @@ const ExhibitionPage = () => {
       octx.globalCompositeOperation = 'source-over';
 
       const blob = await new Promise(res => offscreen.toBlob(res, 'image/jpeg', 0.92));
-      if (!blob) { setDbg('ERR: toBlob returned null'); return; }
+      if (!blob) return;
 
-      setDbg(`blob ok (${(blob.size/1024).toFixed(0)} KB) — uploading to imgBB…`);
       const url = await uploadToImgBB(blob);
-      if (!url) { setDbg('ERR: imgBB upload failed (check key + network)'); return; }
+      if (!url) return;
 
-      setDbg(`imgBB ok — relaying to Redis…`);
       setSyncing(true);
       try {
-        const r = await fetch('/api/set-image', {
+        await fetch('/api/set-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
         });
-        setDbg(r.ok ? `done ✓  ${new Date().toLocaleTimeString()}` : `ERR: set-image returned ${r.status}`);
-      } catch (e) {
-        setDbg(`ERR: set-image fetch threw — ${e.message}`);
+      } catch {
+        // silently ignore — next capture will retry
       }
       setTimeout(() => setSyncing(false), 1500);
     };
@@ -365,11 +356,6 @@ const ExhibitionPage = () => {
             )}
           </div>
         </div>
-      )}
-
-      {/* Temporary debug overlay — remove once capture is confirmed working */}
-      {started && (
-        <p className="absolute bottom-6 left-6 text-white/50 text-xs font-mono">{dbg}</p>
       )}
 
       {started && syncing && (
