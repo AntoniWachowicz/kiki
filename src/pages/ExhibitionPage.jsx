@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { QRCodeSVG } from 'qrcode.react';
 import { createStippleSession } from '../stippleGenerator';
 
 // Trace fade settings.
@@ -379,6 +380,26 @@ const ExhibitionPage = () => {
 
       {started && syncing && (
         <div className="absolute bottom-6 left-6 w-1.5 h-1.5 rounded-full bg-white/30 animate-pulse" />
+      )}
+
+      {/* QR code — bottom-right, with Polish label stacked to its left */}
+      {started && (
+        <div className="absolute bottom-6 right-6 flex items-center gap-4">
+          <div className="text-right text-white/45 text-[13px] uppercase tracking-widest leading-[1.6] font-mono">
+            <p>Zeskanuj</p>
+            <p>swój</p>
+            <p>obraz</p>
+          </div>
+          <div className="p-2 bg-black">
+            <QRCodeSVG
+              value={`${window.location.origin}/current`}
+              size={101}
+              bgColor="#000000"
+              fgColor="#ffffff"
+              level="M"
+            />
+          </div>
+        </div>
       )}
 
     </div>
