@@ -6,7 +6,15 @@ const CapturePage = () => {
 
   useEffect(() => {
     const url = new URLSearchParams(window.location.search).get('url');
-    if (url) setImageUrl(url);
+    if (url) {
+      setImageUrl(url);
+    } else {
+      // No url param — fetch the latest from the relay (e.g. direct navigation to /capture)
+      fetch('/api/current-json')
+        .then(r => r.json())
+        .then(d => { if (d.url) setImageUrl(d.url); })
+        .catch(() => {});
+    }
   }, []);
 
   // Auto-trigger download once the image URL is known
